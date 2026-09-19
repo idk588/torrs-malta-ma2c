@@ -142,6 +142,7 @@ class A2C:
                 save_file = 'checkpoint-' + str(int(checkpoint))
         if save_file is not None:
             self.saver.restore(self.sess, model_dir + save_file)
+            self.cur_step = save_step
             logging.info('Checkpoint loaded: %s' % save_file)
             return True
         logging.error('Can not find old checkpoint for %s' % model_dir)

@@ -105,74 +105,46 @@ def _route_is_valid(edge_seq):
     return True
 
 
-def _bfs_path(src, max_depth=15, want_tl_count=2):
-    """BFS from src; return the first path with >= want_tl_count TL crossings
-    and length >= 4. Returns None if no such path exists."""
+def _validate_routes(routes):
+    """Assert every corridor is a usable route choice, or fail loudly.
+
+    A corridor is only usable if both alternatives share their first edge:
+    vehicles are collected on up_edge (= route_a[0]) and TraCI refuses a
+    setRoute whose target does not contain the vehicle's current edge. An
+    earlier version of this function silently replaced invalid routes with
+    unrelated BFS paths, which produced corridors whose alternatives began
+    in different parts of the network — every route swap then failed and the
+    route agents became no-ops. Fail fast instead of corrupting the study.
+    """
     _build_net_index()
-    edge_graph = _NET_CACHE['edge_graph']
-    edge_to = _NET_CACHE['edge_to']
-    tl_junctions = _NET_CACHE['tl_junctions']
-    visited = {src: None}
-    queue = deque([(src, 0, 0)])
-    while queue:
-        cur, depth, tl_count = queue.popleft()
-        if tl_count >= want_tl_count and depth >= 4:
-            path = []
-            x = cur
-            while x is not None:
-                path.append(x)
-                x = visited[x]
-            return list(reversed(path))
-        if depth >= max_depth:
-            continue
-        for nxt in edge_graph.get(cur, ()):
-            if nxt in visited:
-                continue
-            visited[nxt] = cur
-            new_tl = tl_count + (1 if edge_to.get(nxt) in tl_junctions else 0)
-            queue.append((nxt, depth + 1, new_tl))
-    return None
 
-
-def _validate_or_fix_routes(routes):
-    """For every (corridor, alternative) edge sequence, keep it if valid;
-    otherwise replace it with a BFS-discovered passenger-allowed path that
-    crosses at least 2 TL junctions. Each corridor is guaranteed to end
-    with exactly 2 alternatives (env requires this)."""
-    _build_net_index()
-    passenger_edges = _NET_CACHE['passenger_edges']
-    sources_pool = sorted(passenger_edges)
-    rng = np.random.default_rng(123)
-
-    fixed = []
     for i, route_set in enumerate(routes):
-        new_set = []
-        for r in route_set:
-            if _route_is_valid(r):
-                new_set.append(r)
-                continue
-            # try to extend the original first edge if it's at least passenger-allowed
-            seed_src = r[0] if (r and r[0] in passenger_edges) else None
-            new_path = _bfs_path(seed_src) if seed_src else None
-            if new_path is None:
-                # last resort: pick random passenger-allowed sources
-                for _ in range(50):
-                    cand = sources_pool[rng.integers(0, len(sources_pool))]
-                    new_path = _bfs_path(cand)
-                    if new_path:
-                        break
-            if new_path is None:
-                # absolute last resort: a single passenger edge — SUMO will
-                # accept it (single-edge route) even if it doesn't cross a TL
-                new_path = [sources_pool[rng.integers(0, len(sources_pool))]]
-            print('[Malta route fix] corridor %d alt %d: replaced %r with %d-edge path'
-                  % (i + 1, len(new_set) + 1, r, len(new_path)))
-            new_set.append(new_path)
-        # env requires exactly 2 alternatives per corridor
-        while len(new_set) < 2:
-            new_set.append(new_set[0])
-        fixed.append(new_set[:2])
-    return fixed
+        tag = 'corridor %d' % (i + 1)
+        if len(route_set) != 2:
+            raise ValueError('%s: expected exactly 2 alternatives, got %d'
+                             % (tag, len(route_set)))
+        route_a, route_b = route_set
+        for k, r in enumerate(route_set):
+            if not r:
+                raise ValueError('%s alt %d: empty route' % (tag, k + 1))
+            if not _route_is_valid(r):
+                raise ValueError(
+                    '%s alt %d is not a connected passenger-allowed path: %r'
+                    % (tag, k + 1, r))
+        if route_a[0] != route_b[0]:
+            raise ValueError(
+                '%s: alternatives must share their first edge (the approach '
+                'edge vehicles are rerouted from), got %r vs %r'
+                % (tag, route_a[0], route_b[0]))
+        if route_a == route_b:
+            raise ValueError('%s: both alternatives are identical, so the '
+                             'route agent can have no effect' % tag)
+        if route_a[-1] != route_b[-1]:
+            print('[Malta routes] warning: %s alternatives end on different '
+                  'edges (%s vs %s) — they do not reconverge, so switching '
+                  'changes destination rather than balancing load'
+                  % (tag, route_a[-1], route_b[-1]))
+    return routes
 
 
 def write_file(path, content):
@@ -230,45 +202,65 @@ def get_routes():
     """
     Route-choice alternatives for Malta corridors using real SUMO edge IDs.
 
-    Corridor 1 — Route choice at junction 6484114392 (two alternatives):
-      Route A: via 1657799943 and 301487637 (longer alternative)
-      Route B: direct to 6484114393
+    Each corridor is a genuine parallel route choice: both alternatives start
+    on the same approach edge, diverge onto edge-disjoint branches, and
+    reconverge on the same destination edge. That shared first edge is what
+    makes rerouting possible at all — vehicles are collected on it (up_edge)
+    and TraCI only accepts a setRoute whose target contains the vehicle's
+    current edge. Because the two branches serve the same origin-destination
+    pair, switching between them balances load across parallel paths instead
+    of changing where vehicles are going.
 
-    Corridors 2-4 — Bidirectional arterial pairs
+    Corridors were derived from malta.net.xml by searching for diverge points
+    whose branches reconverge, then ranked by traffic-light crossings, lane
+    count and branch length, and selected to be spatially non-overlapping.
     """
     routes = [
-        # Corridor 1: main route choice point
-        # Route A: 54444410#2 -> 1264291443 -> 33698427#1
-        # Route B: 824060363#1 (direct)
+        # Corridor 1: Msida-area arterial, diverge at -15806386#3,
+        # reconverging on -1456229447#1 (808m vs 1055m, 4 TL crossings)
         [
-            ['54444410#2', '1264291443', '33698427#1'],
-            ['824060363#1'],
+            ['-15806386#3', '-15806418#4', '-15806418#3', '-15806418#2',
+             '-15806418#1', '-15806418#0', '15806399#8', '15806399#9',
+             '15806399#10', '-1456229447#1'],
+            ['-15806386#3', '-15806386#2', '-15806386#1', '-15806386#0',
+             '-1456229448', '-1456229447#1'],
         ],
 
-        # Corridor 2: bidirectional arterial
+        # Corridor 2: diverge at 1330839310#5, reconverging on 516164732#0
+        # (874m vs 468m, 3 TL crossings)
         [
-            ['-1456229447#1'],
-            ['1456229447#1'],
+            ['1330839310#5', '-522027338#1', '-522027338#0', '136705430',
+             '136705412', '522027337#0', '522027337#1', '522027337#2',
+             '522027337#3', '516164732#0'],
+            ['1330839310#5', '522027338#2', '522027338#3', '522027338#4',
+             '-64444535#4', '-64444535#3', '-64444535#2', '-64444535#1',
+             '-64444535#0', '516164732#0'],
         ],
 
-        # Corridor 3: bidirectional arterial
+        # Corridor 3: diverge at 1264339210, reconverging on 154271794
+        # (593m vs 440m, 2 TL crossings)
         [
-            ['-27446664#1'],
-            ['27446664#1'],
+            ['1264339210', '364130462#0', '364130462#1', '30014934#1',
+             '22895632#4', '22895632#5', '518049423', '-26544420#0',
+             '154271794'],
+            ['1264339210', '26440346#0', '26440346#1', '26440346#2',
+             '26440346#3', '1387038412', '514551777', '1023447884',
+             '154271794'],
         ],
 
-        # Corridor 4: bidirectional arterial
+        # Corridor 4: diverge at -24318333, reconverging on 1292523373
+        # (520m vs 502m, 2 TL crossings)
         [
-            ['-743322159'],
-            ['743322159'],
+            ['-24318333', '-29434717#1', '24318330', '-374916246#3',
+             '-374916246#2', '-374916246#1', '-374916246#0',
+             '-1292523375#1', '-1292523375#0', '1292523373'],
+            ['-24318333', '29434717#2', '29434717#3', '29434717#4',
+             '-29434716#2', '-29434716#1', '-29434716#0', '374916256',
+             '1292523374', '1292523373'],
         ],
     ]
 
-    # Auto-validate and repair: any route whose edges aren't connected in the
-    # network (or aren't passenger-allowed) gets replaced with a BFS-discovered
-    # path. This stops SUMO from erroring out on "no valid route" and from
-    # silently dropping flows on disallowed edges.
-    routes = _validate_or_fix_routes(routes)
+    routes = _validate_routes(routes)
     rc_num = sum(len(r) - 1 for r in routes)
     return routes, rc_num
 

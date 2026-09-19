@@ -752,9 +752,15 @@ class TrafficSimulator:
         else:
             avg_speed = 0
             avg_waiting_time = 0
+        # For Sioux, ilds_in entries are lane IDs (legacy). For other
+        # scenarios (e.g. Malta) ilds_in holds laneAreaDetector IDs and the
+        # actual lane IDs are kept on node.lanes_in — see _measure_reward_step.
+        use_lanes = self.name != 'Sioux'
         queues = []
         for node_name in self.node_names:
-            for ild in self.nodes[node_name].ilds_in:
+            node = self.nodes[node_name]
+            iter_ids = node.lanes_in if use_lanes else node.ilds_in
+            for ild in iter_ids:
                 try:
                     queues.append(self.sim.lane.getLastStepHaltingNumber(ild))
                 except Exception:

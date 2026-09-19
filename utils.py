@@ -168,6 +168,12 @@ class Counter:
         self.cur_step = next(self.counter)
         return self.cur_step
 
+    def resume(self, start_step):
+        """Fast-forward the counter to continue from a loaded checkpoint's step."""
+        self.counter = itertools.count(start_step + 1)
+        self.cur_step = start_step
+        self.cur_test_step = start_step
+
     def should_test(self):
         test = False
         if (self.cur_step - self.cur_test_step) >= self.test_step:
