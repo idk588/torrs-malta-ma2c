@@ -99,6 +99,7 @@ class A2C:
     def _init_scheduler(self, model_config):
         lr_init = model_config.getfloat('lr_init')
         lr_decay = model_config.get('lr_decay')
+        self.entropy_decay = model_config.get('entropy_decay', fallback='constant')
 
         if lr_decay == 'constant':
             self.lr_scheduler = Scheduler(lr_init, decay=lr_decay)
@@ -223,11 +224,15 @@ class IA2C(A2C):
         verbose = _BACKWARD_CALL_COUNT <= 2
         bwd_t0 = time.time()
         cur_lr = self.lr_scheduler.get(self.n_step)
+        # Anneal entropy on the LR schedule: beta = entropy_coef * cur_lr / lr_init.
+        # shortcut: A2C.backward and backward_mp don't anneal; add this feed if RQ2 trains A2C.
+        beta_frac = (cur_lr / self.lr_scheduler.val
+                     if self.entropy_decay == 'linear' else None)
         n_chunks = (self.n_agent + _BATCH_CHUNK - 1) // _BATCH_CHUNK
         if verbose:
-            print('  [backward call %d] %d agents in %d chunks of %d...'
+            print('  [backward call %d] %d agents in %d chunks of %d, entropy frac %s...'
                   % (_BACKWARD_CALL_COUNT, self.n_agent, n_chunks,
-                     _BATCH_CHUNK), flush=True)
+                     _BATCH_CHUNK, beta_frac), flush=True)
 
         for chunk_idx in range(n_chunks):
             chunk_start = chunk_idx * _BATCH_CHUNK
@@ -243,6 +248,8 @@ class IA2C(A2C):
                 sw = summary_writer if i == 0 else None
                 ops, feeds = self.policy_ls[i].prepare_backward(
                     obs, acts, dones, Rs, Advs, cur_lr, summary_writer=sw)
+                if beta_frac is not None:
+                    feeds[self.policy_ls[i].beta] = self.policy_ls[i].entropy_coef * beta_frac
                 ops_per_agent.append(len(ops))
                 chunk_ops.extend(ops)
                 chunk_feeds.update(feeds)

@@ -50,9 +50,11 @@ class ACPolicy:
         self.loss = policy_loss + value_loss + entropy_loss
 
         self.lr = tf.placeholder(tf.float32, [])
+        # Fed per update when entropy is annealed; unfed it is the fixed coefficient.
+        self.beta = tf.placeholder_with_default(float(self.entropy_coef), [])
 
         wts = tf.trainable_variables(scope=self.name)
-        grads = tf.gradients(policy_loss+ entropy_loss*self.entropy_coef, wts)
+        grads = tf.gradients(policy_loss+ entropy_loss*self.beta, wts)
         if max_grad_norm > 0:
             grads, self.grad_norm = tf.clip_by_global_norm(grads, max_grad_norm)
         self.actor_optimizer = tf.train.AdamOptimizer(learning_rate=self.lr, beta1=adam_beta1, beta2=adam_beta2, epsilon=adam_epsilon)

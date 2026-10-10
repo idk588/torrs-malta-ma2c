@@ -6,9 +6,11 @@ Reads directly from malta.net.xml instead of CSV files.
 """
 
 import os
+import subprocess
+import sys
 import xml.etree.ElementTree as ET
 import numpy as np
-from collections import defaultdict, deque
+from collections import defaultdict
 
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data')
 NET_FILE  = os.path.join(DATA_DIR, 'malta.net.xml')
@@ -346,11 +348,13 @@ def output_flows(demand_flows, seed=None, load=False):
     return str_flows
 
 
-def output_config(thread=None, add_file=None):
+def output_config(thread=None, add_file=None, bg_file=None):
     if thread is None:
         rou_file = 'exp.rou.xml'
     else:
         rou_file = 'exp_%d.rou.xml' % int(thread)
+    if bg_file:
+        rou_file += ',' + bg_file
 
     add_line = ''
     if add_file:
@@ -425,6 +429,30 @@ def output_additional(data_path):
     return str_add
 
 
+# Background (non-corridor) demand: random passenger trips across the island
+# so signals off the 4 corridors see traffic. Routing takes minutes, so each
+# seed's file is generated once and cached.
+BG_PERIOD = 1.2  # seconds between background departures (~3000 veh/h)
+
+
+def gen_background_file(path, seed):
+    seed = 0 if seed is None else int(seed)
+    tag = 'bg_%d_p%s' % (seed, BG_PERIOD)   # period in the name so a density change never reuses old files
+    rou = tag + '.rou.xml'
+    if not os.path.exists(path + rou):
+        tool = os.path.join(os.environ['SUMO_HOME'], 'tools', 'randomTrips.py')
+        # Prefix must split('_') to a non-numeric second token: env.py treats
+        # vehicle_id.split('_')[1] == f_id as corridor membership.
+        subprocess.run([sys.executable, tool, '-n', path + 'malta.net.xml',
+                        '-o', path + tag + '.trips.xml', '-r', path + rou,
+                        '-b', '0', '-e', str(time_length), '-p', str(BG_PERIOD),
+                        '--vehicle-class', 'passenger', '--validate',
+                        '--min-distance', '1000', '--prefix', 'bg_x',
+                        '--seed', str(seed)],
+                       check=True, capture_output=True)
+    return rou
+
+
 def gen_rou_file(path, demand_flows, seed=None, thread=None, load=False):
     if thread is None:
         flow_file = 'exp.rou.xml'
@@ -438,5 +466,6 @@ def gen_rou_file(path, demand_flows, seed=None, thread=None, load=False):
     write_file(add_file, output_additional(path))
 
     sumocfg_file = path + ('exp_%d.sumocfg' % thread)
-    write_file(sumocfg_file, output_config(thread=thread, add_file='exp.add.xml'))
+    write_file(sumocfg_file, output_config(thread=thread, add_file='exp.add.xml',
+                                           bg_file=gen_background_file(path, seed)))
     return sumocfg_file
