@@ -132,7 +132,7 @@ def main():
     df = pd.DataFrame([r for n in names for r in arm_metrics(n, seeds)])
     df = df.reindex(columns=['arm', 'seed', 'trips', 'arrived'] + METRICS)
     os.makedirs(OUT_DIR, exist_ok=True)
-    df.to_csv(OUT_DIR + 'per_seed_metrics.csv', index=False)
+    df.to_csv(OUT_DIR + 'per_seed_vs_%s.csv' % ref, index=False)
     cmp_df = compare(df, ref)
     cmp_df.to_csv(OUT_DIR + 'comparison_vs_%s.csv' % ref, index=False)
 
