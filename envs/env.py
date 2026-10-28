@@ -516,6 +516,9 @@ class TrafficSimulator:
         command += ['--tripinfo-output.write-unfinished', 'true']
         if self.is_record:
             command += ['--edgedata-output', self.output_path + ('edgedata_%s.xml' % seed)]
+            # Same SUMO-computed network series as baselines.py, for congestion duration.
+            command += ['--summary-output', self.output_path + ('summary_%s.xml' % seed),
+                        '--summary-output.period', str(self.control_interval_sec)]
         # DEBUG: do NOT ignore route errors; they're often the cause of the crash
         command += ['--ignore-route-errors', 'false']
         # Per-port log filenames so parallel SUMO instances don't overwrite each other
