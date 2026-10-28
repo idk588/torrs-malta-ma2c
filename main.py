@@ -222,6 +222,9 @@ def run_greedy(port=0):
     seeds = [int(s) for s in seeds_str.split(',')]
     env.init_test_seeds(seeds)
     env.train_mode = False
+    # Record tripinfo exactly as Evaluator does, so greedy and MA2C share one metric pipeline.
+    env.cur_episode = 0
+    env.init_data(True, dirs['greedy_data'])
 
     data = []
     for test_ind in range(env.test_num):
@@ -252,6 +255,8 @@ def run_greedy(port=0):
             total_travel += travel
 
         env.terminate()
+        time.sleep(2)
+        env.collect_tripinfo()
         if total_departed > 0:
             avg_wait = total_wait / total_departed
             avg_travel = total_travel / total_departed
@@ -270,6 +275,7 @@ def run_greedy(port=0):
         data.append(log)
         logging.info('Greedy test %d: avg_wait=%.2f s, avg_travel=%.2f s' % (test_ind, avg_wait, avg_travel))
 
+    env.output_data()
     out_path = os.path.join(dirs['greedy_data'], 'greedy_baseline.csv')
     pd.DataFrame(data).to_csv(out_path, index=False)
     logging.info('Greedy baseline saved to %s' % out_path)

@@ -1,4 +1,4 @@
-﻿import logging
+import logging
 from platform import node
 import numpy as np
 import pandas as pd
@@ -512,6 +512,10 @@ class TrafficSimulator:
         command += ['--duration-log.disable', 'True']
         command += ['--tripinfo-output',
                     self.output_path + ('%s_%s_trip.xml' % (self.name, self.problem))]
+        # Stuck vehicles still get a row (arrival=-1) instead of silently leaving the averages.
+        command += ['--tripinfo-output.write-unfinished', 'true']
+        if self.is_record:
+            command += ['--edgedata-output', self.output_path + ('edgedata_%s.xml' % seed)]
         # DEBUG: do NOT ignore route errors; they're often the cause of the crash
         command += ['--ignore-route-errors', 'false']
         # Per-port log filenames so parallel SUMO instances don't overwrite each other

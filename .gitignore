@@ -35,6 +35,7 @@ Malta/signal_route/log/*.log
 sumo_*.log
 sumo_errors.txt
 *_trip.xml
+**/edgedata_*.xml
 
 # ── Training / evaluation run logs ─────────────────────────────────────────
 # Regenerable, and huge: the first extended run alone is 227 MB of repeated
