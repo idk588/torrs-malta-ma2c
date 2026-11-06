@@ -5,6 +5,8 @@
 # ── User-specified exclusions ───────────────────────────────────────────────
 .claude/
 Malta/signal_route_copy/
+# Hand-over context for Claude on another PC (chat transcript, SOI); never public
+claude_context/
 
 # ── SUMO network dataset and caches (regenerated/large) ─────────────────────
 Malta/data/malta.net.xml

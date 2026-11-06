@@ -1,0 +1,7 @@
+# Python 3.11. traci and sumolib come from SUMO 1.26: add %SUMO_HOME%\tools to PYTHONPATH.
+tensorflow==2.18.0
+numpy==2.0.2
+pandas==3.0.3
+scipy==1.17.1
+matplotlib==3.10.9
+seaborn==0.13.2
