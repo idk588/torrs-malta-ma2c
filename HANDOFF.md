@@ -16,14 +16,14 @@ Written 6 November 2026, when the project moved from the laptop (Ryzen 5 5600H) 
   | fixed_rerouting | 83.3% | 524.2 s | 9.8 s | 11.9 | 0.2 |
   | greedy | 54.1% | 982.2 s | 539.7 s | 537.5 | 56.1 |
 
-  These figures were computed in memory with `stats_compare.py`'s functions, and the stats CSVs have not been written yet.
-  - **Against fixed_static:** MA2C cuts the mean wait from 42.8 s to 23.2 s. The paired Wilcoxon test gives p = 0.049, but the paired t-test gives only p = 0.21, because seed 40000 congested badly (96.7 s wait, 38.5 congested minutes); seeds 60000 and 90000 also run 26–28 s.
+  The paired statistics are in `Malta/signal_route/stats/{per_seed,comparison}_vs_ma2c.csv` (commit 816ca94).
+  - **Against fixed_static:** MA2C cuts the mean wait from 42.8 s to 23.2 s and has the lower wait on 9 of 10 seeds. The paired Wilcoxon test gives p = 0.049, but the paired t-test gives only p = 0.21, because seed 40000 congested badly (96.7 s wait, 38.5 congested minutes); seeds 60000 and 90000 also run 26–28 s.
   - **Against actuated_static:** no significant difference.
   - **Against fixed_rerouting:** fixed_rerouting has the shorter travel time (paired t p = 0.041).
 
   stats_compare excludes actuated_rerouting, which has no trip CSV.
 - **Baselines** on the background-traffic network, 10 seeds each, in `Malta/signal_route/baseline_data/`. fixed_static (the reference), actuated_static, fixed_rerouting and greedy are complete. actuated_rerouting has 9 of 10 seeds and no trip CSV, because a Windows Update restart killed it on 28 October; it needs re-running. Its folder holds only `trip_90000.xml` from that aborted run, which is not a result.
-- **Statistics:** `stats_compare.py` writes to `Malta/signal_route/stats/`. The comparisons against fixed_static there (uncommitted) cover greedy and actuated_static only. The MA2C comparison (`python stats_compare.py`, reference ma2c) has not been run yet.
+- **Statistics:** `stats_compare.py` writes to `Malta/signal_route/stats/`. The `*_vs_ma2c.csv` files cover MA2C against greedy, fixed_static, fixed_rerouting and actuated_static (816ca94). The fixed_rerouting arm reads `baseline_data/fixed_rerouting/Malta_signal_route_trip.csv`, which is not committed yet. The comparisons against fixed_static there (also uncommitted) cover greedy and actuated_static only.
 - **Pace on the laptop:** about 57 min per training episode, plus about 70 min of TensorFlow start-up after every restart.
 - **Pace on the home PC:**
   - Training episodes: about 23 min each in episodes 87–100, and 28–31 min earlier.
@@ -58,8 +58,8 @@ The crash-recovery supervisor (`claude_context/supervisor/train_supervisor.ps1`)
 
 ## Next steps (week 2 of the plan onwards)
 
-1. Run `python stats_compare.py` (reference ma2c) and commit the stats, together with the uncommitted fixed_static comparison and `baseline_data/fixed_rerouting/Malta_signal_route_trip.csv`.
-2. Re-run the missing actuated_rerouting seed so all five baselines have 10 seeds, then the paired statistics of MA2C against all five (RQ1). Look into why seed 40000 congests under MA2C.
+1. Commit the uncommitted fixed_static comparison and `baseline_data/fixed_rerouting/Malta_signal_route_trip.csv`, which the MA2C stats depend on.
+2. Re-run the missing actuated_rerouting seed so all five baselines have 10 seeds, then re-run `python stats_compare.py` for MA2C against all five (RQ1). Look into why seed 40000 congests under MA2C.
 3. Re-run the routing ablation on the background network.
 4. RQ3 compliance sweep: adapt `run_diff_com` to the Malta paths and sweep `CAV_rate`.
 5. Peak-season demand (candidate `BG_PERIOD = 0.6`, needs an NSO source), then the RQ2 architecture runs.
