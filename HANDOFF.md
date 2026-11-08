@@ -23,7 +23,7 @@ Written 6 November 2026, when the project moved from the laptop (Ryzen 5 5600H) 
 
   stats_compare excludes actuated_rerouting, which has no trip CSV.
 - **Baselines** on the background-traffic network, 10 seeds each, in `Malta/signal_route/baseline_data/`. fixed_static (the reference), actuated_static, fixed_rerouting and greedy are complete. actuated_rerouting has 9 of 10 seeds and no trip CSV, because a Windows Update restart killed it on 28 October; it needs re-running. Its folder holds only `trip_90000.xml` from that aborted run, which is not a result.
-- **Statistics:** `stats_compare.py` writes to `Malta/signal_route/stats/`. The `*_vs_ma2c.csv` files cover MA2C against greedy, fixed_static, fixed_rerouting and actuated_static (816ca94). The fixed_rerouting arm reads `baseline_data/fixed_rerouting/Malta_signal_route_trip.csv`, which is not committed yet. The comparisons against fixed_static there (also uncommitted) cover greedy and actuated_static only.
+- **Statistics:** `stats_compare.py` writes to `Malta/signal_route/stats/`. The `*_vs_ma2c.csv` files cover MA2C against greedy, fixed_static, fixed_rerouting and actuated_static (816ca94). The fixed_rerouting arm reads `baseline_data/fixed_rerouting/Malta_signal_route_trip.csv` (f4a3bc5). The comparisons against fixed_static there (also uncommitted) cover greedy and actuated_static only.
 - **Pace on the laptop:** about 57 min per training episode, plus about 70 min of TensorFlow start-up after every restart.
 - **Pace on the home PC:**
   - Training episodes: about 23 min each in episodes 87–100, and 28–31 min earlier.
@@ -58,7 +58,7 @@ The crash-recovery supervisor (`claude_context/supervisor/train_supervisor.ps1`)
 
 ## Next steps (week 2 of the plan onwards)
 
-1. Commit the uncommitted fixed_static comparison and `baseline_data/fixed_rerouting/Malta_signal_route_trip.csv`, which the MA2C stats depend on.
+1. Decide whether to commit or regenerate the uncommitted fixed_static comparison (`stats/*_vs_fixed_static.csv`, from 28 October).
 2. Re-run the missing actuated_rerouting seed so all five baselines have 10 seeds, then re-run `python stats_compare.py` for MA2C against all five (RQ1). Look into why seed 40000 congests under MA2C.
 3. Re-run the routing ablation on the background network.
 4. RQ3 compliance sweep: adapt `run_diff_com` to the Malta paths and sweep `CAV_rate`.
