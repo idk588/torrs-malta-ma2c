@@ -195,8 +195,10 @@ A mean over an empty set contributes 0. Relevance weights are not applied under 
 - **`episode_cost.csv` columns:**
 
   ```
-  episode, step, seed, wall_s, rollout_s, update_s, save_s, peak_private_gb, peak_working_set_gb, ckpt_data_mb, ckpt_meta_mb
+  episode, step, seed, wall_s, rollout_s, update_s, save_s, peak_private_gb, peak_working_set_gb, ckpt_data_mb, ckpt_meta_mb, lost
   ```
+
+  `lost` is 0 normally, and 1 on the placeholder row that Recovery appends when a cost row was lost.
 
   A daemon thread samples the python process's private bytes and working set every 1 s (`psutil` if installed, otherwise `GetProcessMemoryInfo` through ctypes) and keeps the per-episode maximum. SUMO is not included.
 - **Traffic files.**
