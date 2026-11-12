@@ -1,0 +1,51 @@
+<routes>
+    <vType id="car" accel="2.6" decel="4.5" sigma="0.5" length="5" maxSpeed="50"/>
+    <route id="route_1_1" edges="-15806386#3 -15806418#4 -15806418#3 -15806418#2 -15806418#1 -15806418#0 15806399#8 15806399#9 15806399#10 -1456229447#1"/>
+    <route id="route_1_2" edges="-15806386#3 -15806386#2 -15806386#1 -15806386#0 -1456229448 -1456229447#1"/>
+    <route id="route_2_1" edges="1330839310#5 -522027338#1 -522027338#0 136705430 136705412 522027337#0 522027337#1 522027337#2 522027337#3 516164732#0"/>
+    <route id="route_2_2" edges="1330839310#5 522027338#2 522027338#3 522027338#4 -64444535#4 -64444535#3 -64444535#2 -64444535#1 -64444535#0 516164732#0"/>
+    <route id="route_3_1" edges="1264339210 364130462#0 364130462#1 30014934#1 22895632#4 22895632#5 518049423 -26544420#0 154271794"/>
+    <route id="route_3_2" edges="1264339210 26440346#0 26440346#1 26440346#2 26440346#3 1387038412 514551777 1023447884 154271794"/>
+    <route id="route_4_1" edges="-24318333 -29434717#1 24318330 -374916246#3 -374916246#2 -374916246#1 -374916246#0 -1292523375#1 -1292523375#0 1292523373"/>
+    <route id="route_4_2" edges="-24318333 29434717#2 29434717#3 29434717#4 -29434716#2 -29434716#1 -29434716#0 374916256 1292523374 1292523373"/>
+    <flow id="flow_1_1" route="route_1_1" begin="0" end="360" vehsPerHour="180.0" type="car"/>
+    <flow id="flow_2_1" route="route_2_1" begin="0" end="360" vehsPerHour="90.0" type="car"/>
+    <flow id="flow_3_1" route="route_3_1" begin="0" end="360" vehsPerHour="80.0" type="car"/>
+    <flow id="flow_4_1" route="route_4_1" begin="0" end="360" vehsPerHour="140.0" type="car"/>
+    <flow id="flow_1_2" route="route_1_1" begin="360" end="720" vehsPerHour="300.0" type="car"/>
+    <flow id="flow_2_2" route="route_2_1" begin="360" end="720" vehsPerHour="60.0" type="car"/>
+    <flow id="flow_3_2" route="route_3_1" begin="360" end="720" vehsPerHour="120.0" type="car"/>
+    <flow id="flow_4_2" route="route_4_1" begin="360" end="720" vehsPerHour="175.0" type="car"/>
+    <flow id="flow_1_3" route="route_1_1" begin="720" end="1080" vehsPerHour="240.0" type="car"/>
+    <flow id="flow_2_3" route="route_2_1" begin="720" end="1080" vehsPerHour="120.0" type="car"/>
+    <flow id="flow_3_3" route="route_3_1" begin="720" end="1080" vehsPerHour="200.0" type="car"/>
+    <flow id="flow_4_3" route="route_4_1" begin="720" end="1080" vehsPerHour="210.0" type="car"/>
+    <flow id="flow_1_4" route="route_1_1" begin="1080" end="1440" vehsPerHour="180.0" type="car"/>
+    <flow id="flow_2_4" route="route_2_1" begin="1080" end="1440" vehsPerHour="90.0" type="car"/>
+    <flow id="flow_3_4" route="route_3_1" begin="1080" end="1440" vehsPerHour="160.0" type="car"/>
+    <flow id="flow_4_4" route="route_4_1" begin="1080" end="1440" vehsPerHour="175.0" type="car"/>
+    <flow id="flow_1_5" route="route_1_1" begin="1440" end="1800" vehsPerHour="480.0" type="car"/>
+    <flow id="flow_2_5" route="route_2_1" begin="1440" end="1800" vehsPerHour="150.0" type="car"/>
+    <flow id="flow_3_5" route="route_3_1" begin="1440" end="1800" vehsPerHour="280.0" type="car"/>
+    <flow id="flow_4_5" route="route_4_1" begin="1440" end="1800" vehsPerHour="280.0" type="car"/>
+    <flow id="flow_1_6" route="route_1_1" begin="1800" end="2160" vehsPerHour="540.0" type="car"/>
+    <flow id="flow_2_6" route="route_2_1" begin="1800" end="2160" vehsPerHour="150.0" type="car"/>
+    <flow id="flow_3_6" route="route_3_1" begin="1800" end="2160" vehsPerHour="320.0" type="car"/>
+    <flow id="flow_4_6" route="route_4_1" begin="1800" end="2160" vehsPerHour="315.0" type="car"/>
+    <flow id="flow_1_7" route="route_1_1" begin="2160" end="2520" vehsPerHour="600.0" type="car"/>
+    <flow id="flow_2_7" route="route_2_1" begin="2160" end="2520" vehsPerHour="240.0" type="car"/>
+    <flow id="flow_3_7" route="route_3_1" begin="2160" end="2520" vehsPerHour="400.0" type="car"/>
+    <flow id="flow_4_7" route="route_4_1" begin="2160" end="2520" vehsPerHour="350.0" type="car"/>
+    <flow id="flow_1_8" route="route_1_1" begin="2520" end="2880" vehsPerHour="540.0" type="car"/>
+    <flow id="flow_2_8" route="route_2_1" begin="2520" end="2880" vehsPerHour="240.0" type="car"/>
+    <flow id="flow_3_8" route="route_3_1" begin="2520" end="2880" vehsPerHour="360.0" type="car"/>
+    <flow id="flow_4_8" route="route_4_1" begin="2520" end="2880" vehsPerHour="280.0" type="car"/>
+    <flow id="flow_1_9" route="route_1_1" begin="2880" end="3240" vehsPerHour="420.0" type="car"/>
+    <flow id="flow_2_9" route="route_2_1" begin="2880" end="3240" vehsPerHour="270.0" type="car"/>
+    <flow id="flow_3_9" route="route_3_1" begin="2880" end="3240" vehsPerHour="240.0" type="car"/>
+    <flow id="flow_4_9" route="route_4_1" begin="2880" end="3240" vehsPerHour="175.0" type="car"/>
+    <flow id="flow_1_10" route="route_1_1" begin="3240" end="3600" vehsPerHour="120.0" type="car"/>
+    <flow id="flow_2_10" route="route_2_1" begin="3240" end="3600" vehsPerHour="300.0" type="car"/>
+    <flow id="flow_3_10" route="route_3_1" begin="3240" end="3600" vehsPerHour="120.0" type="car"/>
+    <flow id="flow_4_10" route="route_4_1" begin="3240" end="3600" vehsPerHour="70.0" type="car"/>
+</routes>

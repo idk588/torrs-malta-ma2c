@@ -5,7 +5,9 @@ Replaces Sioux/data/build_file.py for the Malta road network.
 Reads directly from malta.net.xml instead of CSV files.
 """
 
+import math
 import os
+import shutil
 import subprocess
 import sys
 import xml.etree.ElementTree as ET
@@ -305,18 +307,26 @@ def _get_edge_ids_for_route(edge_sequence):
     return edge_sequence
 
 
+_FLOW_RATIOS = [
+    [0.3, 0.5, 0.4, 0.3, 0.8, 0.9, 1.0, 0.9, 0.7, 0.2],
+    [0.3, 0.2, 0.4, 0.3, 0.5, 0.5, 0.8, 0.8, 0.9, 1.0],
+    [0.2, 0.3, 0.5, 0.4, 0.7, 0.8, 1.0, 0.9, 0.6, 0.3],
+    [0.4, 0.5, 0.6, 0.5, 0.8, 0.9, 1.0, 0.8, 0.5, 0.2],
+]
+
+
+def _scale_flow(flow_val, load):
+    """Scale one flow by the demand factor, rounding half up."""
+    return math.floor(flow_val * load + 0.5)
+
+
 def output_flows(demand_flows, seed=None, load=False):
     routes, _ = get_routes()
     demand_begin = 0
     demand_end   = 3600
     demand_gap   = 360
 
-    ratios = [
-        [0.3, 0.5, 0.4, 0.3, 0.8, 0.9, 1.0, 0.9, 0.7, 0.2],
-        [0.3, 0.2, 0.4, 0.3, 0.5, 0.5, 0.8, 0.8, 0.9, 1.0],
-        [0.2, 0.3, 0.5, 0.4, 0.7, 0.8, 1.0, 0.9, 0.6, 0.3],
-        [0.4, 0.5, 0.6, 0.5, 0.8, 0.9, 1.0, 0.8, 0.5, 0.2],
-    ]
+    ratios = _FLOW_RATIOS
 
     if seed is not None:
         np.random.seed(seed)
@@ -337,7 +347,7 @@ def output_flows(demand_flows, seed=None, load=False):
         for i, route_set in enumerate(routes):
             flow_val = ratios[i % len(ratios)][j] * demand_flows[i % len(demand_flows)]
             if load:
-                flow_val = int(flow_val * load)
+                flow_val = _scale_flow(flow_val, load)
             str_flows += (
                 '    <flow id="flow_%d_%d" route="route_%d_1" '
                 'begin="%d" end="%d" vehsPerHour="%.1f" type="car"/>\n'
@@ -379,7 +389,7 @@ def output_config(thread=None, add_file=None, bg_file=None):
     return cfg
 
 
-def output_additional(data_path):
+def output_additional(data_path, det_file='ild_out.xml'):
     """
     Generate E2 lane-area detectors only on lanes that lead INTO traffic-light
     junctions. The env's _init_agents only ever queries detectors that match
@@ -420,8 +430,8 @@ def output_additional(data_path):
             # TraCI getLastStep* still work regardless of period.
             str_add += (
                 '    <laneAreaDetector id="%s_0" lane="%s" '
-                'pos="0" length="%.2f" period="3600" file="ild_out.xml"/>\n'
-                % (lane_id, lane_id, det_len)
+                'pos="0" length="%.2f" period="3600" file="%s"/>\n'
+                % (lane_id, lane_id, det_len, det_file)
             )
             count += 1
     str_add += '</additional>\n'
@@ -435,37 +445,105 @@ def output_additional(data_path):
 BG_PERIOD = 1.2  # seconds between background departures (~3000 veh/h)
 
 
-def gen_background_file(path, seed):
+def bg_period(factor):
+    """Background departure period for a demand factor (factor 1.0 -> BG_PERIOD)."""
+    return round(BG_PERIOD / factor, 3)
+
+
+def bg_tag(seed, period):
+    # period in the name so a density change never reuses old files
+    return 'bg_%d_p%s' % (int(seed), period)
+
+
+def validate_bg_file(rou_path, period):
+    """Fully parse a background route file; return (ok, vehicle_count)."""
+    count = 0
+    try:
+        closed = False
+        for event, elem in ET.iterparse(rou_path, events=('end',)):
+            if elem.tag == 'vehicle':
+                count += 1
+            elif elem.tag == 'routes':
+                closed = True
+            if elem.tag in ('vehicle', 'trip'):
+                elem.clear()
+        if not closed:
+            return False, count
+    except (ET.ParseError, OSError):
+        return False, count
+    return count >= 0.95 * math.ceil(time_length / period), count
+
+
+def gen_background_file(path, seed, period=BG_PERIOD, generate=True):
     seed = 0 if seed is None else int(seed)
-    tag = 'bg_%d_p%s' % (seed, BG_PERIOD)   # period in the name so a density change never reuses old files
+    tag = bg_tag(seed, period)
     rou = tag + '.rou.xml'
-    if not os.path.exists(path + rou):
-        tool = os.path.join(os.environ['SUMO_HOME'], 'tools', 'randomTrips.py')
+    trips = tag + '.trips.xml'
+    if os.path.exists(path + rou):
+        return rou
+    if not generate:
+        raise FileNotFoundError(path + rou)
+    tool = os.path.join(os.environ['SUMO_HOME'], 'tools', 'randomTrips.py')
+    tmp = path + '_tmp_%s_%d/' % (tag, os.getpid())
+    os.makedirs(tmp, exist_ok=True)
+    try:
         # Prefix must split('_') to a non-numeric second token: env.py treats
         # vehicle_id.split('_')[1] == f_id as corridor membership.
         subprocess.run([sys.executable, tool, '-n', path + 'malta.net.xml',
-                        '-o', path + tag + '.trips.xml', '-r', path + rou,
-                        '-b', '0', '-e', str(time_length), '-p', str(BG_PERIOD),
+                        '-o', tmp + trips, '-r', tmp + rou,
+                        '-b', '0', '-e', str(time_length), '-p', str(period),
                         '--vehicle-class', 'passenger', '--validate',
                         '--min-distance', '1000', '--prefix', 'bg_x',
                         '--seed', str(seed)],
                        check=True, capture_output=True)
+        ok, count = validate_bg_file(tmp + rou, period)
+        if not ok:
+            raise RuntimeError('invalid background file %s (%d vehicles)' % (rou, count))
+        os.replace(tmp + trips, path + trips)
+        os.replace(tmp + rou, path + rou)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
     return rou
 
 
-def gen_rou_file(path, demand_flows, seed=None, thread=None, load=False):
+def expected_corridor_total(demand_flows, factor):
+    """Sum of vehsPerHour over all corridor flows output_flows would write."""
+    routes, _ = get_routes()
+    ratios = _FLOW_RATIOS
+    total = 0.0
+    for j in range(10):
+        for i in range(len(routes)):
+            flow_val = ratios[i % len(ratios)][j] * demand_flows[i % len(demand_flows)]
+            if factor:
+                flow_val = _scale_flow(flow_val, factor)
+            total += float('%.1f' % flow_val)
+    return total
+
+
+def read_corridor_total(rou_path):
+    """Sum of vehsPerHour in a written corridor .rou.xml."""
+    return sum(float(e.attrib['vehsPerHour'])
+               for e in ET.parse(rou_path).getroot().iter('flow'))
+
+
+def gen_rou_file(path, demand_flows, seed=None, thread=None, load=False,
+                 period=BG_PERIOD, generate_bg=True):
     if thread is None:
         flow_file = 'exp.rou.xml'
+        add_name = 'exp.add.xml'
+        det_name = 'ild_out.xml'
     else:
         flow_file = 'exp_%d.rou.xml' % int(thread)
+        add_name = 'exp_%d.add.xml' % int(thread)
+        det_name = 'ild_out_%d.xml' % int(thread)
 
     write_file(path + flow_file, output_flows(demand_flows, seed=seed, load=load))
 
-    # generate detector additional file
-    add_file = path + 'exp.add.xml'
-    write_file(add_file, output_additional(path))
+    # generate detector additional file (per thread, so parallel runs never share it)
+    write_file(path + add_name, output_additional(path, det_file=det_name))
 
     sumocfg_file = path + ('exp_%d.sumocfg' % thread)
-    write_file(sumocfg_file, output_config(thread=thread, add_file='exp.add.xml',
-                                           bg_file=gen_background_file(path, seed)))
+    write_file(sumocfg_file, output_config(
+        thread=thread, add_file=add_name,
+        bg_file=gen_background_file(path, seed, period, generate_bg)))
     return sumocfg_file

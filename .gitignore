@@ -76,3 +76,6 @@ ENV/
 *.egg-info/
 build/
 dist/
+Malta/data/exp_*.add.xml
+Malta/data/ild_out_*.xml
+Malta/data/_tmp_*/
