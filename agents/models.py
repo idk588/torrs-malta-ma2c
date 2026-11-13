@@ -124,10 +124,10 @@ class A2C:
     def save(self, model_dir, global_step):
         self.saver.save(self.sess, model_dir + 'checkpoint', global_step=global_step)
 
-    def load(self, model_dir, checkpoint=None):
+    def load(self, model_dir=None, checkpoint=None):
         save_file = None
         save_step = 0
-        if os.path.exists(model_dir):
+        if model_dir is not None and os.path.exists(model_dir):
             if checkpoint is None:
                 for file in os.listdir(model_dir):
                     if file.startswith('checkpoint'):
@@ -140,8 +140,16 @@ class A2C:
                             save_file = prefix
                             save_step = cur_step
             else:
-                save_file = 'checkpoint-' + str(int(checkpoint))
+                save_step = int(checkpoint)
+                save_file = 'checkpoint-%d' % save_step
         if save_file is not None:
+            # A save_optimizer resume needs the Adam state back; stop rather than restart it from zero.
+            # getattr: only MA2C sets these flags.
+            if getattr(self, 'training', False) and getattr(self, 'save_optimizer', False):
+                prefix = model_dir + save_file
+                if not any(name.endswith('/Adam') for name, _ in tf.train.list_variables(prefix)):
+                    raise RuntimeError('checkpoint %s has no optimiser state; refusing to resume'
+                                       % prefix)
             self.saver.restore(self.sess, model_dir + save_file)
             self.cur_step = save_step
             logging.info('Checkpoint loaded: %s' % save_file)
@@ -414,10 +422,19 @@ class MA2C(IA2C):
                 self.policy_ls.append(self._init_policy(n_s, n_a, n_w, n_f, model_config,
                                                         agent_name='{:d}a'.format(i)))
 
-        self.saver = tf.train.Saver(max_to_keep=5)
+        # save_optimizer (RQ2): a training Saver built after the optimisers also covers the Adam
+        # slots and beta powers, so a resume continues exactly. Otherwise (RQ1, evaluation) the
+        # Saver is policy-only and restores its subset of any checkpoint by name.
+        self.training = bool(total_step)
+        self.save_optimizer = model_config.getboolean('save_optimizer', fallback=False)
+        full_saver = self.training and self.save_optimizer
+        if not full_saver:
+            self.saver = tf.train.Saver(max_to_keep=5)
         if total_step:
             # training
             self.total_step = total_step
             self._init_scheduler(model_config)
             self._init_train(model_config)
+        if full_saver:
+            self.saver = tf.train.Saver(max_to_keep=5)
         self.sess.run(tf.global_variables_initializer())
