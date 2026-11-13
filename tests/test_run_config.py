@@ -1,3 +1,4 @@
+import json
 import os
 import tempfile
 import unittest
@@ -101,6 +102,26 @@ class PidParseTests(unittest.TestCase):
         self.assertEqual(rc.parse_pid_json(
             '{"ProcessId":5,"CommandLine":"python main.py --run a"}', 99), [5])
         self.assertEqual(rc.parse_pid_json('', 1), [])
+
+    def test_run_arg_forms(self):
+        def one(cmd):
+            return rc.parse_pid_json(
+                '{"ProcessId":5,"CommandLine":%s}' % json.dumps(cmd), 99)
+        self.assertEqual(one('python main.py --option evaluate --run x'), [5])
+        self.assertEqual(one('python main.py --run=x'), [5])
+        self.assertEqual(one('python main.py --option train'), [])
+        self.assertEqual(one('python other.py --run x'), [])
+        self.assertEqual(one('python notmain.py --run x'), [])
+
+    def test_parent_chain_excluded(self):
+        cmd = 'python main.py --run a'
+        j = json.dumps([
+            {'ProcessId': 10, 'ParentProcessId': 1, 'CommandLine': cmd},
+            {'ProcessId': 11, 'ParentProcessId': 10, 'CommandLine': cmd},
+            {'ProcessId': 12, 'ParentProcessId': 11, 'CommandLine': cmd},
+            {'ProcessId': 20, 'ParentProcessId': 1, 'CommandLine': 'python main.py --run b'},
+        ])
+        self.assertEqual(rc.parse_pid_json(j, 12), [20])
 
 
 class PrepareStoreTests(unittest.TestCase):

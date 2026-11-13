@@ -16,7 +16,8 @@ RQ1_CONFIG = 'config/config_ma2c_Malta.ini'
 ZONES_SRC = 'Malta/data/zones_nso.csv'
 NAME_RE = re.compile(r'^(?:[a-z][a-z0-9_]*|_smoke_[a-z]+)$')
 OPTIONS = ('train', 'evaluate', 'train_then_evaluate', 'greedy', 'get_parameter')
-PID_RE = re.compile(r'main\.py\s+--run\s+\S+')
+MAIN_RE = re.compile(r'(?<!\w)main\.py(?!\w)')
+RUN_ARG_RE = re.compile(r'(?:^|\s)--run(?:=|\s|$)')
 
 
 @dataclass
@@ -108,18 +109,29 @@ def parse_pid_json(text: str, own_pid: int) -> List[int]:
     data = json.loads(text)
     if isinstance(data, dict):
         data = [data]
+    data = data or []
+    parent = {}
+    for item in data:
+        if item.get('ProcessId') is not None and item.get('ParentProcessId') is not None:
+            parent[int(item['ProcessId'])] = int(item['ParentProcessId'])
+    skip = {own_pid}
+    cur = own_pid
+    while cur in parent and parent[cur] not in skip:
+        cur = parent[cur]
+        skip.add(cur)
     out = []
-    for item in data or []:
+    for item in data:
         cmd = item.get('CommandLine')
         pid = item.get('ProcessId')
-        if cmd and pid is not None and int(pid) != own_pid and PID_RE.search(cmd):
+        if (cmd and pid is not None and int(pid) not in skip
+                and MAIN_RE.search(cmd) and RUN_ARG_RE.search(cmd)):
             out.append(int(pid))
     return out
 
 
 def other_run_pids(own_pid: int) -> List[int]:
     ps = ("Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | "
-          "Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress")
+          "Select-Object ProcessId,ParentProcessId,CommandLine | ConvertTo-Json -Compress")
     r = subprocess.run(['powershell', '-NoProfile', '-Command', ps],
                        capture_output=True, text=True)
     return parse_pid_json(r.stdout, own_pid)
