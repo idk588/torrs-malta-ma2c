@@ -18,7 +18,7 @@ import seaborn as sns
 
 from envs.env import PhaseMap, PhaseSet, RouteMap, RouteSet, TrafficSimulator
 from envs.zones import build_maps, load_zones
-from Malta.build_file import gen_rou_file, get_routes, relevant_ss, get_nodes, get_phases, get_flows
+from Malta.build_file import bg_period, gen_rou_file, get_routes, relevant_ss, get_nodes, get_phases, get_flows
 
 import csv, pickle, os
 
@@ -293,6 +293,8 @@ class MaltaEnv(TrafficSimulator):
             seed = self.seed
         else:
             seed = self.test_seeds[test_ind]
+        # The seed this episode runs with (train_reward.csv's seed column, spec §7).
+        self.episode_seed = seed
         self._init_sim(seed, gui=gui)
         self.cur_sec = 0
         self.cur_episode += 1
@@ -300,6 +302,10 @@ class MaltaEnv(TrafficSimulator):
             self.update_fingerprint(self._init_policy())
         self._init_sim_traffic()
         self.seed += 1
+        # vehwait still holds the previous episode's last step until _measure_reward_step runs;
+        # zero it so the hybrid summary's waiting-time half is 0 at reset (spec §5).
+        for node_name in self.node_names:
+            self.nodes[node_name].vehwait = 0
         return self._get_state(reset=True)
 
     def output_data(self):
@@ -328,6 +334,7 @@ class MaltaEnv(TrafficSimulator):
         if not self.demand_factor > 0:
             raise ValueError('demand_factor must be > 0, got %r' % self.demand_factor)
         self.generate_traffic = generate_traffic
+        self.episode_seed = None  # set by reset() to the seed that episode uses
         super().__init__(config, problem, output_path, is_record, port=port)
 
 
@@ -550,6 +557,13 @@ class MaltaEnv(TrafficSimulator):
 
     def _init_sim_config(self, seed, load):
 
+        # Demand scaling (spec §8). The incoming load is ignored (reset never forwards one):
+        # the level is self.demand_factor. Corridor flows are scaled only when it is not 1.0,
+        # and the background period is bg_period(factor) (1.2 s at 1.0), so at 1.0 the call
+        # equals the RQ1 one and the files are byte-identical. generate_bg=False makes a
+        # missing background file an error instead of a randomTrips run.
+        factor = self.demand_factor
+
         return gen_rou_file(
 
             self.data_path,
@@ -560,7 +574,11 @@ class MaltaEnv(TrafficSimulator):
 
             thread=self.sim_thread,
 
-            load=load
+            load=(False if factor == 1.0 else factor),
+
+            period=bg_period(factor),
+
+            generate_bg=self.generate_traffic
 
         )
 

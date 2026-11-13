@@ -91,7 +91,8 @@ def neighbour_hash(ss, sr, rr, rs):
 def district_summary(wait_means, vehwait_per_lane, district_idx, norm_wait, clip_wait):
     """Hybrid summary: np.array of 12 floats [q_1..q_6, w_1..w_6].
 
-    Per-signal inputs. district_idx holds indices into DISTRICTS (-1 = ignored).
+    Per-signal inputs. district_idx holds indices into DISTRICTS (-1 = ignored; anything
+    outside [-1, 5] raises ValueError).
     q_d = mean of wait_means over district d (already normalised; NaN = no detectors,
     ignored). w_d = mean of clip(vehwait_per_lane / norm_wait, 0, clip_wait) over
     district d. A district with no (finite) values gives 0.0.
@@ -104,8 +105,12 @@ def district_summary(wait_means, vehwait_per_lane, district_idx, norm_wait, clip
                          % (len(wait_means), len(vehwait), len(idx)))
     if not norm_wait > 0:
         raise ValueError('district_summary: norm_wait must be > 0, got %r' % norm_wait)
-    w_node = np.clip(vehwait / float(norm_wait), 0.0, float(clip_wait))
     n = len(DISTRICTS)
+    bad = idx[(idx < -1) | (idx >= n)]
+    if bad.size:
+        raise ValueError('district_summary: district_idx must be in [-1, %d], got %s'
+                         % (n - 1, sorted(set(bad.tolist()))[:10]))
+    w_node = np.clip(vehwait / float(norm_wait), 0.0, float(clip_wait))
     out = np.zeros(2 * n)
     for d in range(n):
         members = idx == d

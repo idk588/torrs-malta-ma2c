@@ -10,13 +10,15 @@ import random
 import xml.etree.cElementTree as ET
 import os
 
-from envs.zones import COMM_ARCHS as ZONE_COMM_ARCHS, DISTRICTS
+from envs.zones import COMM_ARCHS as ZONE_COMM_ARCHS, DISTRICTS, district_summary
 from envs.zones import neighbour_hash as zones_neighbour_hash
 
 DEFAULT_PORT = 27500
 # RQ2 information architectures (spec §5): 'local' = RQ1 maps; the others come from NSO districts.
 COMM_ARCHS = ('local',) + ZONE_COMM_ARCHS
 REWARD_SHARES = ('sum', 'mean')
+# Hybrid arm: [q_1..q_6, w_1..w_6] per district, at the end of every agent's n_o segment.
+SUMMARY_LEN = 2 * len(DISTRICTS)
 SEC_IN_MS = 1000
 
 REALNET_REWARD_NORM = 20
@@ -175,6 +177,9 @@ class TrafficSimulator:
             raise ValueError('reward_share must be one of %s, got %r' % (REWARD_SHARES, self.reward_share))
         if not self.norm_summary_wait > 0:
             raise ValueError('norm_summary_wait must be > 0, got %r' % self.norm_summary_wait)
+        if self.comm_arch == 'hybrid' and self.problem != 'signal_route':
+            # The summary sits in the n_o segment, which only signal_route observations have.
+            raise ValueError("comm_arch 'hybrid' needs problem 'signal_route', got %r" % self.problem)
         # Zone file contents ({agent_id: district}, {agent_id: 'signal'|'route'}); _init_map sets
         # them for cloud, fog and hybrid. They stay None under 'local'.
         self.zone_of = None
@@ -306,6 +311,11 @@ class TrafficSimulator:
         if problem is not None:
             self.problem = problem
         self._clip_state()
+        # Hybrid (spec §5): one district summary per call, from the clipped signal states; the
+        # same 12 values close every agent's n_o segment. None for every other arm.
+        summary = None
+        if self.comm_arch == 'hybrid' and self.problem == 'signal_route':
+            summary = self._hybrid_summary()
         state_signal = []
         state_route = []
         if self.problem == 'signal' or self.problem == 'signal_route':
@@ -318,6 +328,8 @@ class TrafficSimulator:
                 if self.problem == 'signal_route':
                     for rrc_name in node.relevant_sr:
                         cur_state.append(self.rcs[rrc_name].arrival_state)
+                if summary is not None:
+                    cur_state.append(summary)
                 for nnode_name in node.relevant_ss:
                     fset = []
                     for f in self.nodes[nnode_name].fingerprint:
@@ -344,6 +356,8 @@ class TrafficSimulator:
                 if self.problem == 'signal_route':
                     for nnode_name in rc.relevant_rs:
                         cur_state.append(self.nodes[nnode_name].wave_state)
+                if summary is not None:
+                    cur_state.append(summary)
                 for rrc_name in rc.relevant_rr:
                     fset = []
                     for f in self.rcs[rrc_name].fingerprint:
@@ -364,6 +378,30 @@ class TrafficSimulator:
         elif self.problem == 'route':
             state = state_route
         return state
+
+    def _hybrid_summary(self):
+        """The hybrid arm's 12 values [q_1..q_6, w_1..w_6] (spec §5), via zones.district_summary.
+
+        Signal agents only; call after _clip_state(), so wait_state is already normalised and
+        clipped (q is not normalised again). A node without detectors has an empty wait_state;
+        its mean is NaN, which district_summary ignores.
+
+        vehwait is the reward's waiting time from the last _measure_reward_step (0 after reset).
+        _measure_reward_step sums it over node.lanes_in, which is getControlledLanes(): one entry
+        per controlled link, so a lane feeding several links appears several times. Dividing by
+        len(lanes_in), the same list, gives the mean per summed entry. The Malta reward iterates
+        lanes_in (Sioux iterates ilds_in, but hybrid is Malta-only). max(1, .) guards a node with
+        no lanes, whose vehwait is 0.
+        """
+        wait_means = np.empty(len(self.node_names))
+        vehwait_per_lane = np.empty(len(self.node_names))
+        for i, node_name in enumerate(self.node_names):
+            node = self.nodes[node_name]
+            wait = np.asarray(node.wait_state, dtype=np.float64)
+            wait_means[i] = wait.mean() if wait.size else np.nan
+            vehwait_per_lane[i] = node.vehwait / max(1, len(node.lanes_in))
+        return district_summary(wait_means, vehwait_per_lane, self._district_idx,
+                                self.norm_summary_wait, self.clips['wait'])
 
     def _init_agents(self):
         lane_to_detectors = {}
@@ -631,6 +669,8 @@ class TrafficSimulator:
         n_w_ls_signal = []
         n_f_ls_signal = []
         n_o_ls_signal = []
+        # Hybrid: the district summary closes every agent's n_o segment (see _get_state).
+        n_summary = SUMMARY_LEN if (self.comm_arch == 'hybrid' and self.problem == 'signal_route') else 0
         for node_name in self.node_names:
             node = self.nodes[node_name]
             num_wave = node.num_state
@@ -646,7 +686,7 @@ class TrafficSimulator:
                     num_fingerprint += self.rcs[rrc_name].num_fingerprint
             n_s_ls_signal.append(num_wave)
             n_w_ls_signal.append(num_wait)
-            n_o_ls_signal.append(num_arrival)
+            n_o_ls_signal.append(num_arrival + n_summary)
             n_f_ls_signal.append(num_fingerprint)
         n_s_ls_route = []
         n_w_ls_route = []
@@ -667,7 +707,7 @@ class TrafficSimulator:
                     num_fingerprint += self.nodes[nnode_name].num_fingerprint
             n_s_ls_route.append(num_arrival)
             n_w_ls_route.append(num_occupancy)
-            n_o_ls_route.append(num_wave)
+            n_o_ls_route.append(num_wave + n_summary)
             n_f_ls_route.append(num_fingerprint)
         if self.problem == 'signal':
             self.n_s_ls = n_s_ls_signal
@@ -1078,7 +1118,7 @@ class TrafficSimulator:
                            'reward': global_reward}
             self.control_data.append(cur_control)
         agent_reward = reward
-        reward = self._local_reward_step(reward)
+        reward = self._share_reward(reward)
         reward = self._clip_reward(reward)
         if not self.train_mode:
             return state, reward, done, global_reward, arrived_number, departed_number, waiting_time, travel_time, agent_reward
@@ -1135,6 +1175,57 @@ class TrafficSimulator:
                         cur_reward += self.coop_gamma_rr * reward[j - n]
                 new_reward.append(cur_reward)
         return np.array(new_reward)
+
+    def _share_reward(self, reward):
+        """Neighbour reward sharing as step() applies it: 'mean' (RQ2) or 'sum' (RQ1).
+
+        _get_reward(get_parameter=True) calls _local_reward_step directly and stays on sum.
+        """
+        if self.reward_share == 'mean':
+            return self._mean_reward_step(reward)
+        return self._local_reward_step(reward)
+
+    def _mean_reward_step(self, reward):
+        """Mean sharing (RQ2, spec §6), from raw per-agent rewards before normalisation:
+
+            signal i: r_i' = r_i + gamma_ss * mean_{j in SS(i)} r_j + gamma_sr * mean_{j in SR(i)} r_j
+            route i:  r_i' = r_i + gamma_rr * mean_{j in RR(i)} r_j + gamma_rs * mean_{j in RS(i)} r_j
+
+        A mean over an empty set adds 0, and the relevance weights (_sr_w, _rs_w) are not
+        applied. Partial arrays follow the sum branch: under problem 'signal' (signals only) or
+        'route' (routes only, rr indices shifted back by n) the cross-type term is skipped.
+        Returns a new float64 array; the input is not modified.
+        """
+        reward = np.asarray(reward, dtype=np.float64)
+        n = len(self.node_names)
+
+        def mean_of(idx, offset=0):
+            if len(idx) == 0:
+                return 0.0
+            return reward[np.asarray(idx, dtype=np.int64) - offset].mean()
+
+        new_reward = []
+        if self.problem != 'route':
+            for i in range(n):
+                cur_reward = reward[i] + self.coop_gamma_ss * mean_of(self._ss_idx[i])
+                if self.problem == 'signal_route':
+                    cur_reward += self.coop_gamma_sr * mean_of(self._sr_idx[i])
+                new_reward.append(cur_reward)
+        if self.problem != 'signal':
+            for k in range(len(self.rc_names)):
+                if self.problem == 'signal_route':
+                    cur_reward = reward[n + k] + self.coop_gamma_rr * mean_of(self._rr_idx[k])
+                    cur_reward += self.coop_gamma_rs * mean_of(self._rs_idx[k])
+                else:
+                    cur_reward = reward[k] + self.coop_gamma_rr * mean_of(self._rr_idx[k], n)
+                new_reward.append(cur_reward)
+        return np.array(new_reward, dtype=np.float64)
+
+    def _shared_terms(self, reward):
+        """r' - r: what step()'s sharing adds to each raw reward, before normalisation and
+        clipping (tools/check_env.py's same-scale rule). Follows reward_share and self.problem."""
+        reward = np.asarray(reward, dtype=np.float64)
+        return self._share_reward(reward) - reward
 
     def update_fingerprint(self, policy):
         if self.problem != 'route':

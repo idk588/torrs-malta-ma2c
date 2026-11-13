@@ -269,6 +269,17 @@ class TestDistrictSummary(unittest.TestCase):
         out = district_summary(np.array([]), np.array([]), np.array([], dtype=int), 60.0, 2.0)
         np.testing.assert_array_equal(out, np.zeros(12))
 
+    def test_rejects_district_idx_out_of_range(self):
+        for bad in (6, -2, 99):
+            with self.assertRaises(ValueError, msg=bad):
+                district_summary(np.array([0.1, 0.2]), np.array([1.0, 2.0]),
+                                 np.array([0, bad]), 60.0, 2.0)
+        # -1 (ignored) and 5 (Gozo & Comino) are the bounds of the valid range
+        out = district_summary(np.array([0.1, 0.2]), np.array([60.0, 120.0]),
+                               np.array([-1, 5]), 60.0, 2.0)
+        self.assertAlmostEqual(out[5], 0.2)
+        self.assertAlmostEqual(out[11], 2.0)
+
 
 class TestZoneFile(unittest.TestCase):
     def test_zone_file(self):
