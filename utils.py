@@ -15,6 +15,8 @@ def check_dir(cur_dir):
 import os
 import shutil
 
+from run_files import append_cost_row, atomic_savetxt, atomic_write_csv, file_size_mb
+
 def copy_file(src_dir, tar_dir, suffix='.ini'):
 
     os.makedirs(tar_dir, exist_ok=True)
@@ -36,24 +38,28 @@ def find_file(cur_dir, suffix='.ini'):
 
 
 def init_dir(base_dir, pathes=['log', 'data', 'model']):
-    if not os.path.exists(base_dir):
-        os.mkdir(base_dir)
+    """Create base_dir/<path>/ for each path (parents too) and return {path: 'base_dir/<path>/'}.
+    A base_dir given with a trailing '/' (a store such as 'Malta/runs/<name>/') is not doubled."""
+    os.makedirs(base_dir, exist_ok=True)
+    base = base_dir[:-1] if base_dir.endswith('/') else base_dir
     dirs = {}
     for path in pathes:
-        cur_dir = base_dir + '/%s/' % path
-        if not os.path.exists(cur_dir):
-            os.mkdir(cur_dir)
+        cur_dir = base + '/%s/' % path
+        os.makedirs(cur_dir, exist_ok=True)
         dirs[path] = cur_dir
     return dirs
 
 
 def init_log(log_dir):
+    # force=True: replace (and close) any handlers an earlier init_log or import installed,
+    # so this run's log file always receives the log.
     logging.basicConfig(format='%(asctime)s [%(levelname)s] %(message)s',
                         level=logging.INFO,
                         handlers=[
                             logging.FileHandler('%s/%d.log' % (log_dir, time.time())),
                             logging.StreamHandler()
-                        ])
+                        ],
+                        force=True)
 
 
 def init_test_flag(test_mode):
@@ -191,7 +197,20 @@ class Counter:
 
 
 class Trainer():
-    def __init__(self, env, model, problem,global_counter, summary_writer, run_test, output_path=None):
+    def __init__(self, env, model, problem,global_counter, summary_writer, run_test, output_path=None,
+                 store_dir=None, strict_save=False, sampler=None):
+        """store_dir: the run store every per-episode file goes to (train_reward.csv,
+        agent_reward.csv, episode_cost.csv, model/), with a trailing '/':
+        'Malta/signal_route/' for RQ1, 'Malta/runs/<name>/' for RQ2.
+        strict_save: re-raise a failed checkpoint save instead of logging a warning.
+        sampler: a started run_files.MemorySampler for the cost row's memory peaks, or None.
+        """
+        if not isinstance(store_dir, str) or not store_dir.endswith('/'):
+            raise ValueError("Trainer needs store_dir ending in '/', got %r" % (store_dir,))
+        self.store_dir = store_dir
+        self.strict_save = strict_save
+        self.sampler = sampler
+        self.last_saved_step = 0  # global step of the newest checkpoint this Trainer saved
         self.cur_step=0
         self.global_counter = global_counter
         self.problem=problem
@@ -346,7 +365,8 @@ class Trainer():
                            'total waiting time': total_waiting_time,
                            'total travel time': total_travel_time,
                            'average waiting time': total_waiting_time / total_departed_number,
-                           'average travel time': total_travel_time / total_departed_number}
+                           'average travel time': total_travel_time / total_departed_number,
+                           'seed': self.env.episode_seed}
 
                     self.data.append(log)
                 self._add_summary(rewards, global_step, is_train=False)
@@ -354,6 +374,9 @@ class Trainer():
                              (global_step, rewards))
 
             # train
+            episode_start = time.perf_counter()  # wall_s: the whole episode, save included
+            rollout_s = 0.0
+            update_s = 0.0
             self.env.train_mode = True
             ob = self.env.reset()
 
@@ -368,7 +391,9 @@ class Trainer():
             total_agent_reward=[]
             self.cur_step = 0
             while True:
+                t0 = time.perf_counter()
                 ob, done, R, cur_rewards,agent_reward,arrived_number, departed_number,waiting_time,travel_time = self.explore(ob,done)
+                rollout_s += time.perf_counter() - t0
                 global_step = self.global_counter.cur_step
                 rewards += cur_rewards
                 total_arrived_number += arrived_number
@@ -381,7 +406,9 @@ class Trainer():
                 else:
                     total_agent_reward+=np.array(agent_reward)
 
+                t0 = time.perf_counter()
                 self.model.backward(R, self.summary_writer, global_step)
+                update_s += time.perf_counter() - t0
                 # termination
                 if done:
                     #到达3600s
@@ -398,7 +425,8 @@ class Trainer():
                    'total waiting time':total_waiting_time,
                    'total travel time': total_travel_time,
                    'average waiting time':total_waiting_time/total_departed_number,
-                   'average travel time': total_travel_time / total_departed_number
+                   'average travel time': total_travel_time / total_departed_number,
+                   'seed': self.env.episode_seed
                    }
 
             self.data.append(log)
@@ -407,33 +435,66 @@ class Trainer():
             self._add_summary(rewards, global_step)
             self.summary_writer.flush()
 
-            # ------------------------------------------------------------------
-            # Per-episode persistence so an interrupted run is still useful.
-            # Writes CSVs and a model checkpoint after every completed episode.
-            # ------------------------------------------------------------------
-            try:
-                csv_dir = self.output_path.replace('data', self.problem)
-                os.makedirs(csv_dir, exist_ok=True)
-                pd.DataFrame(self.data).to_csv(csv_dir + 'train_reward.csv')
-                np.savetxt(csv_dir + 'agent_reward.csv',
-                           self.agent_reward, delimiter=',')
-            except Exception as e:
-                logging.warning('Per-episode CSV save failed: %s' % e)
-            try:
-                model_dir = self.output_path.replace('data', self.problem) + 'model/'
-                os.makedirs(model_dir, exist_ok=True)
-                self.model.save(model_dir, global_step)
-                logging.info('Checkpoint saved at step %d -> %s' %
-                             (global_step, model_dir))
-            except Exception as e:
-                logging.warning('Per-episode checkpoint save failed: %s' % e)
-            # ------------------------------------------------------------------
-        # Final write (redundant if the loop saved every episode, but kept for
-        # cases where the loop body didn't execute).
-        df = pd.DataFrame(self.data)
-        path = self.output_path.replace('data', self.problem)
-        df.to_csv(path + 'train_reward.csv')
-        np.savetxt(path + 'agent_reward.csv', self.agent_reward, delimiter=',')
+            self._persist_episode(global_step, episode_start, rollout_s, update_s)
+
+    def _persist_episode(self, global_step, episode_start, rollout_s, update_s):
+        """Write this episode's files to the store, in the order the queue runner relies on
+        (spec section 7), so an interrupted run is still useful:
+          1. train_reward.csv and agent_reward.csv (atomic);
+          2. the checkpoint, <store>model/checkpoint-<step>;
+          3. a row appended to episode_cost.csv;
+          4. the log line 'Checkpoint saved at step <N> -> <store>model/'.
+        A failed save re-raises when strict_save is set (no cost row, no log line);
+        otherwise it logs a warning, and the cost row is still written without the line.
+        """
+        store = self.store_dir
+        model_dir = store + 'model/'
+        os.makedirs(store, exist_ok=True)
+
+        # 1. Training history: the formats main.py's resume reads back (read_csv index_col=0,
+        #    loadtxt delimiter=',').
+        atomic_write_csv(pd.DataFrame(self.data), store + 'train_reward.csv')
+        atomic_savetxt(self.agent_reward, store + 'agent_reward.csv', delimiter=',')
+
+        # 2. Checkpoint.
+        save_start = time.perf_counter()
+        try:
+            os.makedirs(model_dir, exist_ok=True)
+            self.model.save(model_dir, global_step)
+            saved = True
+        except Exception as e:
+            if self.strict_save:
+                raise
+            logging.warning('Per-episode checkpoint save failed: %s' % e)
+            saved = False
+        save_end = time.perf_counter()
+        if saved:
+            self.last_saved_step = global_step
+
+        # 3. Compute cost of this episode.
+        if self.sampler is not None:
+            peak_private_gb, peak_working_set_gb = self.sampler.take_episode_peaks()
+        else:
+            peak_private_gb = peak_working_set_gb = float('nan')
+        prefix = model_dir + 'checkpoint-%d' % global_step
+        append_cost_row(store + 'episode_cost.csv', {
+            'episode': global_step // int(self.env.T),
+            'step': global_step,
+            'seed': self.env.episode_seed,
+            'wall_s': save_end - episode_start,
+            'rollout_s': rollout_s,
+            'update_s': update_s,
+            'save_s': save_end - save_start,
+            'peak_private_gb': peak_private_gb,
+            'peak_working_set_gb': peak_working_set_gb,
+            'ckpt_data_mb': file_size_mb(prefix + '.data-00000-of-00001') if saved else float('nan'),
+            'ckpt_meta_mb': file_size_mb(prefix + '.meta') if saved else float('nan'),
+            'lost': 0,
+        })
+
+        # 4. The line the queue runner parses (exact format).
+        if saved:
+            logging.info('Checkpoint saved at step %d -> %s' % (global_step, model_dir))
 
 
 class Tester(Trainer):
