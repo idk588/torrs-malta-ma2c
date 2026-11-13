@@ -10,7 +10,13 @@ import random
 import xml.etree.cElementTree as ET
 import os
 
+from envs.zones import COMM_ARCHS as ZONE_COMM_ARCHS, DISTRICTS
+from envs.zones import neighbour_hash as zones_neighbour_hash
+
 DEFAULT_PORT = 27500
+# RQ2 information architectures (spec §5): 'local' = RQ1 maps; the others come from NSO districts.
+COMM_ARCHS = ('local',) + ZONE_COMM_ARCHS
+REWARD_SHARES = ('sum', 'mean')
 SEC_IN_MS = 1000
 
 REALNET_REWARD_NORM = 20
@@ -158,6 +164,21 @@ class TrafficSimulator:
         self.train_mode = True
         test_seeds = config.get('test_seeds').split(',')
         test_seeds = [int(s) for s in test_seeds]
+        # RQ2 keys (spec §4). Each fallback is the RQ1 behaviour, so the RQ1 config needs no edits.
+        # They are read before _init_map, which builds the neighbour maps from comm_arch.
+        self.comm_arch = config.get('comm_arch', fallback='local')
+        self.reward_share = config.get('reward_share', fallback='sum')
+        self.norm_summary_wait = config.getfloat('norm_summary_wait', fallback=60.0)
+        if self.comm_arch not in COMM_ARCHS:
+            raise ValueError('comm_arch must be one of %s, got %r' % (COMM_ARCHS, self.comm_arch))
+        if self.reward_share not in REWARD_SHARES:
+            raise ValueError('reward_share must be one of %s, got %r' % (REWARD_SHARES, self.reward_share))
+        if not self.norm_summary_wait > 0:
+            raise ValueError('norm_summary_wait must be > 0, got %r' % self.norm_summary_wait)
+        # Zone file contents ({agent_id: district}, {agent_id: 'signal'|'route'}); _init_map sets
+        # them for cloud, fog and hybrid. They stay None under 'local'.
+        self.zone_of = None
+        self.zone_type = None
         self._init_map()
         self.init_data(is_record, output_path)
         self.init_test_seeds(test_seeds)
@@ -436,6 +457,71 @@ class TrafficSimulator:
                 self.agent_type.append('route')
         self._init_action_space()
         self._init_state_space()
+        self._build_index_arrays()
+
+    def _build_index_arrays(self):
+        """Integer neighbour indices, built once so no per-step name lookups are needed.
+
+        Global agent index: signal i -> i (its position in node_names), route k -> len(node_names) + k.
+        _ss_idx and _sr_idx hold one array per signal, _rr_idx and _rs_idx one per route. Each array
+        follows the order of the agent's own neighbour map, so sums accumulate in the same order as
+        the name lookups did. _sr_w / _rs_w are the matching relevance weights. _district_idx holds,
+        per signal, its index into zones.DISTRICTS (-1 when no zone file is loaded, as under 'local').
+        The maps are aliased into the Node/Rc objects and must not be mutated after this point.
+        """
+        n = len(self.node_names)
+        if self.comm_arch != 'local':
+            self._check_zone_ids()
+        sig_pos = {name: i for i, name in enumerate(self.node_names)}
+        rc_pos = {name: n + k for k, name in enumerate(self.rc_names)}
+
+        def positions(owner, neighbours, pos):
+            missing = [a for a in neighbours if a not in pos]
+            if missing:
+                raise ValueError('agent %s: neighbours %s are not agents of this env'
+                                 % (owner, missing[:10]))
+            return np.array([pos[a] for a in neighbours], dtype=np.int64)
+
+        def weights(neighbour_map):
+            return np.array([neighbour_map[a] for a in neighbour_map], dtype=np.float64)
+
+        self._ss_idx, self._sr_idx, self._sr_w = [], [], []
+        for name in self.node_names:
+            node = self.nodes[name]
+            self._ss_idx.append(positions(name, node.relevant_ss, sig_pos))
+            self._sr_idx.append(positions(name, node.relevant_sr, rc_pos))
+            self._sr_w.append(weights(node.relevant_sr))
+        self._rr_idx, self._rs_idx, self._rs_w = [], [], []
+        for name in self.rc_names:
+            rc = self.rcs[name]
+            self._rr_idx.append(positions(name, rc.relevant_rr, rc_pos))
+            self._rs_idx.append(positions(name, rc.relevant_rs, sig_pos))
+            self._rs_w.append(weights(rc.relevant_rs))
+        if self.zone_of is None:
+            self._district_idx = np.full(n, -1, dtype=np.int64)
+        else:
+            self._district_idx = np.array(
+                [DISTRICTS.index(self.zone_of[s]) if s in self.zone_of else -1
+                 for s in self.node_names], dtype=np.int64)
+
+    def _check_zone_ids(self):
+        """The zone file's signal ids must equal node_names and its route ids rc_names."""
+        if self.zone_of is None or self.zone_type is None:
+            raise ValueError('comm_arch %r needs a zone file, but none was loaded' % self.comm_arch)
+        unknown = sorted(a for a, t in self.zone_type.items() if t not in ('signal', 'route'))
+        if unknown:
+            raise ValueError('zone file: unknown agent type for %s' % unknown[:10])
+        for kind, ids in (('signal', self.node_names), ('route', self.rc_names)):
+            in_file = {a for a, t in self.zone_type.items() if t == kind}
+            if in_file != set(ids):
+                raise ValueError('zone file %s ids differ from the env: only in file %s, only in env %s'
+                                 % (kind, sorted(in_file - set(ids))[:10],
+                                    sorted(set(ids) - in_file)[:10]))
+
+    def neighbour_hash(self):
+        """SHA-256 of the four neighbour maps this env was built with (zones.neighbour_hash)."""
+        return zones_neighbour_hash(self.relevant_ss_map, self.relevant_sr_map,
+                                    self.relevant_rr_map, self.relevant_rs_map)
 
     def _init_action_space(self):
         n_a_ls_signal = []
@@ -1018,35 +1104,35 @@ class TrafficSimulator:
         return np.array(rewards)
 
     def _local_reward_step(self, reward):
+        # Sum sharing (RQ1). The index arrays replace the per-neighbour name lookups; the loops,
+        # the += order and the gamma * weight * reward products are unchanged, so the floats are
+        # identical. reward may be partial: _get_reward(get_parameter=True) passes signals only
+        # (problem 'signal') or routes only (problem 'route'). Returns a new array; step() keeps
+        # the raw input as agent_reward.
+        n = len(self.node_names)
         new_reward = []
         if self.problem != 'route':
-            for i in range(len(self.node_names)):
-                node_name = self.node_names[i]
+            for i in range(n):
                 cur_reward = reward[i]
-                for nnode_name in self.nodes[node_name].relevant_ss:
-                    j = self.node_names.index(nnode_name)
+                for j in self._ss_idx[i]:
                     cur_reward += self.coop_gamma_ss * reward[j]
                 if self.problem == 'signal_route':
-                    for rrc_name in self.nodes[node_name].relevant_sr:
-                        j = self.rc_names.index(rrc_name)
-                        cur_reward += self.coop_gamma_sr * self.nodes[node_name].relevant_sr[rrc_name] * reward[len(self.node_names) + j]
+                    for j, w in zip(self._sr_idx[i], self._sr_w[i]):
+                        cur_reward += self.coop_gamma_sr * w * reward[j]
                 new_reward.append(cur_reward)
         if self.problem != 'signal':
-            for i in range(len(self.rc_names)):
-                rc_name = self.rc_names[i]
+            for k in range(len(self.rc_names)):
                 if self.problem == 'signal_route':
-                    cur_reward = reward[len(self.node_names) + i]
-                    for rrc_name in self.rcs[rc_name].relevant_rr:
-                        j = self.rc_names.index(rrc_name)
-                        cur_reward += self.coop_gamma_rr * reward[len(self.node_names) + j]
-                    for nnode_name in self.rcs[rc_name].relevant_rs:
-                        j = self.node_names.index(nnode_name)
-                        cur_reward += self.coop_gamma_rs * self.rcs[rc_name].relevant_rs[nnode_name] * reward[j]
-                else:
-                    cur_reward = reward[i]
-                    for rrc_name in self.rcs[rc_name].relevant_rr:
-                        j = self.rc_names.index(rrc_name)
+                    cur_reward = reward[n + k]
+                    for j in self._rr_idx[k]:
                         cur_reward += self.coop_gamma_rr * reward[j]
+                    for j, w in zip(self._rs_idx[k], self._rs_w[k]):
+                        cur_reward += self.coop_gamma_rs * w * reward[j]
+                else:
+                    # Route-only array: route k sits at k, so shift its global index back by n.
+                    cur_reward = reward[k]
+                    for j in self._rr_idx[k]:
+                        cur_reward += self.coop_gamma_rr * reward[j - n]
                 new_reward.append(cur_reward)
         return np.array(new_reward)
 

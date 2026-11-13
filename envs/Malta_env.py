@@ -17,9 +17,19 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 
 from envs.env import PhaseMap, PhaseSet, RouteMap, RouteSet, TrafficSimulator
+from envs.zones import build_maps, load_zones
 from Malta.build_file import gen_rou_file, get_routes, relevant_ss, get_nodes, get_phases, get_flows
 
-import pickle, os
+import csv, pickle, os
+
+# NSO-district zone file (tools/build_zones.py), read from data_path for cloud, fog and hybrid.
+ZONES_FILE = 'zones_nso.csv'
+
+
+def _load_zone_types(csv_path):
+    """{agent_id: 'signal' | 'route'} from a zone file, for the env's id cross-check."""
+    with open(csv_path, encoding='utf-8-sig', newline='') as f:
+        return {row['agent_id']: row['type'] for row in csv.DictReader(f)}
 
 _CACHE_FILE = os.path.join(os.path.dirname(__file__), '..', 'Malta', 'data', 'malta_cache_v2.pkl')
 
@@ -309,8 +319,15 @@ class MaltaEnv(TrafficSimulator):
             self.trip_data = []
 
 
-    def __init__(self, config, problem, output_path='', is_record=False, port=0):
+    def __init__(self, config, problem, output_path='', is_record=False, port=0,
+                 generate_traffic=True):
         self.demand_flows = _cache['flows']
+        # Demand level (1.0 = RQ1 base demand) and whether a missing background file may be
+        # generated; both are used by _init_sim_config, so they are set before super().__init__.
+        self.demand_factor = config.getfloat('demand_factor', fallback=1.0)
+        if not self.demand_factor > 0:
+            raise ValueError('demand_factor must be > 0, got %r' % self.demand_factor)
+        self.generate_traffic = generate_traffic
         super().__init__(config, problem, output_path, is_record, port=port)
 
 
@@ -474,13 +491,30 @@ class MaltaEnv(TrafficSimulator):
 
         self.route_map = MaltaRoute()
 
-        self.relevant_ss_map = self._init_relevant_ss_map()
+        if self.comm_arch == 'local':
 
-        self.relevant_rs_map = self.route_map.relevant_rs_map
+            self.relevant_ss_map = self._init_relevant_ss_map()
 
-        self.relevant_sr_map = self.route_map.relevant_sr_map
+            self.relevant_rs_map = self.route_map.relevant_rs_map
 
-        self.relevant_rr_map = self.route_map.relevant_rr_map
+            self.relevant_sr_map = self.route_map.relevant_sr_map
+
+            self.relevant_rr_map = self.route_map.relevant_rr_map
+
+        else:
+
+            # cloud / fog / hybrid (spec §5): the four maps come from the NSO districts and
+            # replace MaltaRoute's maps (its edge-keyed relevant_rs_map is not used). hybrid
+            # uses the fog maps. Lists follow global order: sorted NODE, then RC_NAMES.
+            zone_csv = self.data_path + ZONES_FILE
+
+            self.zone_of = load_zones(zone_csv)
+
+            self.zone_type = _load_zone_types(zone_csv)
+
+            (self.relevant_ss_map, self.relevant_sr_map,
+             self.relevant_rr_map, self.relevant_rs_map) = build_maps(
+                self.comm_arch, NODE, RC_NAMES, self.zone_of)
 
         self.up_edge_map = self.route_map.up_edge_map
 
@@ -496,19 +530,21 @@ class MaltaEnv(TrafficSimulator):
 
         self.state_names_route = STATE_NAMES_ROUTE
 
-        # clean relevant_rs_map to only keep TL node keys
+        if self.comm_arch == 'local':
 
-        tl_set = set(NODE)
+            # clean relevant_rs_map to only keep TL node keys
 
-        for rc in self.relevant_rs_map:
+            tl_set = set(NODE)
 
-            self.relevant_rs_map[rc] = {
+            for rc in self.relevant_rs_map:
 
-                k: v for k, v in self.relevant_rs_map[rc].items()
+                self.relevant_rs_map[rc] = {
 
-                if k in tl_set
+                    k: v for k, v in self.relevant_rs_map[rc].items()
 
-            }
+                    if k in tl_set
+
+                }
 
 
 
