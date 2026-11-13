@@ -293,8 +293,10 @@ class Trainer():
 
         return ob, done, R, rewards,agent_reward,total_arrived_number, total_departed_number,total_waiting_time,total_travel_time
 
-    def perform(self, test_ind, demo=True, policy_type='default',load=False):
+    def perform(self, test_ind, demo=True, policy_type='default',load=False, after_reset=None):
         ob = self.env.reset(gui=demo, test_ind=test_ind,load=load)
+        if after_reset is not None:
+            after_reset()  # the episode's route files now exist (Evaluator.run's first-reset hook)
         # note this done is pre-decision to reset LSTM states!
         done = True
         self.model.reset()
@@ -522,14 +524,26 @@ class Evaluator(Tester):
         self.demo = demo
         self.policy_type = policy_type
 
-    def run(self):
+    def run(self, after_first_reset=None):
+        """Evaluate every test seed, recording into self.output_path: SUMO's per-seed files and
+        the three CSVs (episodes 1..n). The RQ2 sweep sets output_path to each demand level's
+        folder before calling run; it must be a folder path ending in '/'.
+
+        after_first_reset, if given, is called once, right after the first seed's env.reset
+        (its route files are written) and before that seed's 'test 0' line.
+        """
+        if self.output_path and not self.output_path.endswith(('/', '\\')):
+            raise ValueError('Evaluator output_path must end with a path separator: %r'
+                             % self.output_path)
         is_record = True
         self.env.cur_episode = 0
         self.env.init_data(is_record, self.output_path)
         time.sleep(1)
 
         for test_ind in range(self.test_num):
-            reward, _,_,_,_,_ = self.perform(test_ind, demo=self.demo, policy_type=self.policy_type)
+            hook = after_first_reset if test_ind == 0 else None
+            reward, _,_,_,_,_ = self.perform(test_ind, demo=self.demo, policy_type=self.policy_type,
+                                             after_reset=hook)
             self.env.terminate()
             logging.info('test %i, avg reward %.2f' % (test_ind, reward))
             time.sleep(2)

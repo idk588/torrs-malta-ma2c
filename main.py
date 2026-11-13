@@ -24,7 +24,10 @@ from tensorflow.python.util import deprecation
 deprecation._PRINT_DEPRECATION_WARNINGS = False
 
 import configparser
+import logging
+import math
 import sys
+import time
 import tensorflow as tf
 # Report what TF can see — useful to confirm oneDNN + GPU detection.
 print('>>> TF version:', tf.__version__, '| logical CPUs:', _n_cores, flush=True)
@@ -40,10 +43,16 @@ import threading
 from envs.Malta_env import MaltaEnv as SiouxEnv, MaltaController as SiouxController
 from agents.models import MA2C
 from utils import *
-from run_config import assert_not_rq1, other_run_pids, parse_args, prepare_store
+from Malta.build_file import bg_period, expected_corridor_total, read_corridor_total
+from run_config import (assert_not_rq1, configs_equal, other_run_pids, parse_args,
+                        prepare_store)
 from run_files import MemorySampler
 
-# Exit code when another `main.py --run` python is alive (spec section 4, one instance).
+# Exit codes of the --run refusals (spec section 4): the run's config or neighbour maps differ
+# from its store (4), no checkpoint at total_step to evaluate (5), another `main.py --run`
+# python is alive (6, one instance).
+EXIT_STORE_MISMATCH = 4
+EXIT_NO_CHECKPOINT = 5
 EXIT_OTHER_RUN = 6
 
 
@@ -380,9 +389,164 @@ def evaluate():
         thread.join()
 
 
+def _refuse(code, msg):
+    print(msg, file=sys.stderr, flush=True)
+    raise SystemExit(code)
+
+
+def level_dir(store, level):
+    """The folder one demand level's evaluation writes into: '<store>eva_data/f1.10/'."""
+    return store + 'eva_data/f%.2f/' % level
+
+
+def resolve_levels(spec, cfg):
+    """The demand levels to evaluate, as factors of base demand: --levels if given, else
+    ENV_CONFIG eval_levels from the store config (comma-separated), else [1.0].
+
+    Refuses (exit 2) a level that is not a finite number > 0, and two levels that would share
+    one 'f%.2f' folder.
+    """
+    if spec.levels:
+        levels = [float(x) for x in spec.levels]
+    else:
+        raw = cfg.get('ENV_CONFIG', 'eval_levels', fallback='')
+        try:
+            levels = [float(x) for x in raw.split(',') if x.strip()]
+        except ValueError:
+            _refuse(2, 'refusing: invalid eval_levels %r' % raw)
+        levels = levels or [1.0]
+    folders = set()
+    for level in levels:
+        if not (math.isfinite(level) and level > 0):
+            _refuse(2, 'refusing: demand level %r is not a number > 0' % level)
+        name = 'f%.2f' % level
+        if name in folders:
+            _refuse(2, 'refusing: two demand levels share the folder %s' % name)
+        folders.add(name)
+    return levels
+
+
+def _set_aside_level_dir(store, out):
+    """Move an existing level folder to <store>eva_data/_failed_<YYYYmmdd-HHMMSS>/, keeping its
+    name (…/_failed_20261113-151200/f1.10/), so a new attempt starts in an empty folder."""
+    if not os.path.exists(out):
+        return
+    name = os.path.basename(out.rstrip('/'))
+    stamp = time.strftime('%Y%m%d-%H%M%S')
+    dest_root, k = store + 'eva_data/_failed_%s/' % stamp, 1
+    while os.path.exists(dest_root + name):
+        dest_root, k = store + 'eva_data/_failed_%s-%d/' % (stamp, k), k + 1
+    os.makedirs(dest_root, exist_ok=True)
+    os.rename(out.rstrip('/'), dest_root + name)
+    logging.info('Evaluation: moved the existing %s to %s' % (out, dest_root + name))
+
+
+def _level_start_logger(env, level, started):
+    """The hook Evaluator.run calls after the level's first reset: it reads the corridor total
+    back from the route file that reset wrote and logs the EVAL_LEVEL_START line."""
+    expected = expected_corridor_total(env.demand_flows, level)
+    rou_path = env.data_path + 'exp_%d.rou.xml' % env.sim_thread
+
+    def log_start():
+        total = read_corridor_total(rou_path)
+        logging.info('EVAL_LEVEL_START f%.2f bg_tag=p%s corridor_total=%g corridor_expected=%g'
+                     % (level, bg_period(level), total, expected))
+        if total != expected:
+            logging.warning('Evaluation: f%.2f corridor total %g in %s, expected %g'
+                            % (level, total, rou_path, expected))
+        started.append(total)
+    return log_start
+
+
 def evaluate_sweep(spec):
-    """Evaluate run spec.name at its demand levels (spec section 8)."""
-    raise SystemExit('evaluate_sweep: implemented in Task 11')
+    """Evaluate run spec.name's final checkpoint at each demand level (spec section 8).
+
+    Runs in the main thread: any error propagates, so the process exits non-zero and the
+    completion line is not printed. Refuses while another `main.py --run` python is alive (6),
+    when the store has no config.ini, when config/runs/<name>.ini or the neighbour maps differ
+    from the store (4), and when <store>model/ has no checkpoint at total_step (5). Every
+    setting comes from <store>config.ini.
+
+    Each level writes into level_dir(store, level) (an existing one is moved to
+    eva_data/_failed_<stamp>/ first) and logs, around its 'test i' lines:
+        EVAL_LEVEL_START f%.2f bg_tag=p%s corridor_total=%g corridor_expected=%g
+        EVAL_LEVEL_DONE f%.2f seeds=%d
+    and the last line printed is '>>> EVALUATE COMPLETE levels=<k>'. Returns 0.
+    """
+    store = spec.store_dir
+    others = other_run_pids(os.getpid())
+    if others:
+        _refuse(EXIT_OTHER_RUN, 'refusing: another main.py --run is running (pid %s)'
+                % ', '.join(str(p) for p in others))
+    model_dir = store + 'model/'
+    assert_not_rq1(store, spec.rq1)
+    assert_not_rq1(model_dir, spec.rq1)
+    store_config = store + 'config.ini'
+    if not os.path.isfile(store_config):
+        raise SystemExit('refusing: %s not found; run %s has no trained store to evaluate'
+                         % (store_config, spec.name))
+    if not os.path.isfile(spec.config_path):
+        raise SystemExit('refusing: config %s not found' % spec.config_path)
+    same, diffs = configs_equal(spec.config_path, store_config)
+    if not same:
+        _refuse(EXIT_STORE_MISMATCH, 'evaluate refused for %s: config differs from %s: %s'
+                % (store, spec.config_path, ', '.join(diffs)))
+    config = configparser.ConfigParser()
+    config.read(store_config, encoding='utf-8-sig')
+    levels = resolve_levels(spec, config)
+    total_step = int(config.getfloat('TRAIN_CONFIG', 'total_step'))
+    checkpoint = model_dir + 'checkpoint-%d' % total_step
+    if not os.path.isfile(checkpoint + '.index'):
+        _refuse(EXIT_NO_CHECKPOINT, 'refusing: no checkpoint %s to evaluate' % checkpoint)
+
+    dirs = init_dir(store, pathes=['eva_data', 'logs'])
+    init_log(dirs['logs'])
+    logging.info('Evaluate run %s: store %s, checkpoint-%d, levels %s'
+                 % (spec.name, store, total_step, ','.join('%.2f' % f for f in levels)))
+
+    # The env is built once, at base demand; each level then sets env.demand_factor.
+    env_config = config['ENV_CONFIG']
+    if env_config.getfloat('demand_factor', fallback=1.0) != 1.0:
+        logging.info('Evaluation: building the env at demand_factor 1.0 (config has %s)'
+                     % env_config['demand_factor'])
+        env_config['demand_factor'] = '1.0'
+    print('>>> Initializing env (launches SUMO for dimensions)...', flush=True)
+    env = init_env(env_config, port=0, output_path=dirs['logs'], generate_traffic=False)
+    logging.info('Evaluation: s dim: %d, a dim %d, s dim ls: %r, a dim ls: %r' %
+                 (env.n_s, env.n_a, env.n_s_ls, env.n_a_ls))
+    hash_path = store + 'neighbours.sha256'
+    stored_hash = None
+    if os.path.exists(hash_path):
+        with open(hash_path, encoding='utf-8') as f:
+            stored_hash = f.read().strip()
+    maps_hash = env.neighbour_hash()
+    if stored_hash != maps_hash:
+        _refuse(EXIT_STORE_MISMATCH, 'evaluate refused for %s: neighbour hash differs: '
+                'stored=%s current=%s' % (store, stored_hash, maps_hash))
+
+    print('>>> Building MA2C model and restoring checkpoint-%d...' % total_step, flush=True)
+    seed = config.getint('ENV_CONFIG', 'seed')
+    model = MA2C(env.n_s_ls, env.n_a_ls, env.n_w_ls, env.n_f_ls, 0, config['MODEL_CONFIG'],
+                 problem, agent_type=env.agent_type, n_o_ls=env.n_o_ls, seed=seed)
+    if not model.load(model_dir, checkpoint=total_step):
+        _refuse(EXIT_NO_CHECKPOINT, 'refusing: could not load %s' % checkpoint)
+    logging.info('Evaluation: test seeds %s' % ','.join(str(s) for s in env.test_seeds))
+
+    evaluator = Evaluator(env, model, level_dir(store, levels[0]))
+    for level in levels:
+        out = level_dir(store, level)
+        _set_aside_level_dir(store, out)
+        os.makedirs(out)
+        env.demand_factor = level
+        env.cur_episode = 0
+        evaluator.output_path = out  # Evaluator.run calls env.init_data(True, out) first
+        started = []
+        evaluator.run(after_first_reset=_level_start_logger(env, level, started))
+        if not started:
+            raise RuntimeError('evaluation of f%.2f ran no test seed' % level)
+        logging.info('EVAL_LEVEL_DONE f%.2f seeds=%d' % (level, env.test_num))
+    print('>>> EVALUATE COMPLETE levels=%d' % len(levels), flush=True)
+    return 0
 
 
 # Defaults for the RQ1 functions (evaluate, run_greedy, get_parameter); main() sets
