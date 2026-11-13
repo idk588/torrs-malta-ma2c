@@ -24,6 +24,7 @@ from tensorflow.python.util import deprecation
 deprecation._PRINT_DEPRECATION_WARNINGS = False
 
 import configparser
+import sys
 import tensorflow as tf
 # Report what TF can see — useful to confirm oneDNN + GPU detection.
 print('>>> TF version:', tf.__version__, '| logical CPUs:', _n_cores, flush=True)
@@ -39,15 +40,22 @@ import threading
 from envs.Malta_env import MaltaEnv as SiouxEnv, MaltaController as SiouxController
 from agents.models import MA2C
 from utils import *
+from run_config import assert_not_rq1, other_run_pids, parse_args, prepare_store
+from run_files import MemorySampler
+
+# Exit code when another `main.py --run` python is alive (spec section 4, one instance).
+EXIT_OTHER_RUN = 6
 
 
-def init_env(config, port=0, naive_policy=False):
+def init_env(config, port=0, naive_policy=False, output_path='', generate_traffic=True):
+    """output_path: where SUMO writes its trip/log files ('' = the working directory, as RQ1).
+    generate_traffic: False makes a missing background traffic file an error (RQ2 runs)."""
+    env = SiouxEnv(config, problem, output_path=output_path, port=port,
+                   generate_traffic=generate_traffic)
     if not naive_policy:
-        return SiouxEnv(config, problem, port=port)
-    else:
-        env = SiouxEnv(config, problem, port=port)
-        policy = SiouxController(env.node_names, env.rc_names)
-        return env, policy
+        return env
+    policy = SiouxController(env.node_names, env.rc_names)
+    return env, policy
 
 
 def get_parameter(scenario):
@@ -59,24 +67,84 @@ def get_parameter(scenario):
     env.terminate()
 
 
-def train():
-    base_dir = default_base_dir
-    dirs = init_dir(base_dir)
-    store_dir = default_store_dir
-    dirs2 = init_dir(store_dir)
-    init_log(dirs2['log'])
-    config_dir = default_config_dir
-    copy_file(config_dir, dirs['data'])
+def _read_resume_history(store, resumed_step):
+    """The training history a resumed run carries forward: train_reward.csv as records and
+    agent_reward.csv as rows, cut back to the checkpoint.
+
+    Rows with step > resumed_step belong to an episode whose CSVs were written but whose
+    checkpoint was not (a crash between the two); that episode is trained again, so its rows
+    are dropped here, with the matching agent_reward rows (one per training row, in order).
+    """
+    data, agent_reward = [], []
+    train_csv = store + 'train_reward.csv'
+    agent_csv = store + 'agent_reward.csv'
+    if os.path.exists(train_csv):
+        data = pd.read_csv(train_csv, index_col=0).to_dict('records')
+    if os.path.exists(agent_csv):
+        arr = np.loadtxt(agent_csv, delimiter=',')
+        if arr.ndim == 1:
+            arr = arr.reshape(1, -1)
+        agent_reward = list(arr)
+    kept = [r for r in data if r['step'] <= resumed_step]
+    n_train = sum(1 for r in kept if r.get('test_id', -1) == -1)
+    dropped_agent = max(0, len(agent_reward) - n_train)
+    agent_reward = agent_reward[:n_train]
+    if len(kept) < len(data) or dropped_agent:
+        logging.warning('Resume: dropped %d train_reward row(s) and %d agent_reward row(s) '
+                        'past checkpoint step %d' % (len(data) - len(kept), dropped_agent,
+                                                     resumed_step))
+    if len(agent_reward) < n_train:
+        logging.warning('Resume: agent_reward.csv has %d row(s) for %d training episode(s)'
+                        % (len(agent_reward), n_train))
+    return kept, agent_reward
+
+
+def train(spec):
+    """Train MA2C for spec, resuming from the newest checkpoint in <store>model/ if any.
+
+    --run (RQ2): everything stays in the run store spec.store_dir ('Malta/runs/<name>/'):
+    model/, logs/ and sim/ (SUMO files). It refuses while another `main.py --run` python is
+    alive and refuses RQ1 paths; prepare_store copies the config, zone file and neighbour-map
+    hash on first launch and checks them on resume. A checkpoint-save error is raised.
+    --rq1: the RQ1 layout under Malta/signal_route/ (log/, data/, model/), as before.
+
+    The last line printed is '>>> TRAINING COMPLETE step <N>', N being the step reached
+    (total_step), also when the checkpoint already is at total_step.
+    """
+    store = spec.store_dir
+    rq2 = not spec.rq1
+    if rq2:
+        others = other_run_pids(os.getpid())
+        if others:
+            print('refusing: another main.py --run is running (pid %s)'
+                  % ', '.join(str(p) for p in others), file=sys.stderr, flush=True)
+            raise SystemExit(EXIT_OTHER_RUN)
+    model_dir = store + 'model/'
+    assert_not_rq1(store, spec.rq1)
+    assert_not_rq1(model_dir, spec.rq1)
+    config_path = spec.config_path
+    if not os.path.isfile(config_path):
+        raise SystemExit('refusing: config %s not found' % config_path)
+    if rq2:
+        dirs = init_dir(store, pathes=['model', 'logs', 'sim'])
+        log_dir, sim_dir = dirs['logs'], dirs['sim']
+    else:
+        dirs = init_dir(store)  # RQ1: log/, data/, model/
+        log_dir, sim_dir = dirs['log'], ''
+    init_log(log_dir)
     config = configparser.ConfigParser()
-    config.read(config_dir)
-    test_mode = 'no_test'
-    in_test, post_test = init_test_flag(test_mode)
+    config.read(config_path, encoding='utf-8-sig')  # as run_config compares it; a BOM is ignored
+    in_test, _ = init_test_flag('no_test')  # no in-training tests, as before
 
     # init env
     print(">>> Initializing env (launches SUMO for dimensions)...", flush=True)
-    env = init_env(config['ENV_CONFIG'], port=0)
+    env = init_env(config['ENV_CONFIG'], port=0, output_path=sim_dir, generate_traffic=not rq2)
     logging.info('Training: s dim: %d, a dim %d, s dim ls: %r, a dim ls: %r' %
                  (env.n_s, env.n_a, env.n_s_ls, env.n_a_ls))
+    if rq2:
+        first = prepare_store(spec, env.neighbour_hash())
+        logging.info('Run %s: %s; store %s, config %s' % (
+            spec.name, 'first launch' if first else 'resume, store checked', store, config_path))
 
     print(">>> Building MA2C model...", flush=True)
 
@@ -100,13 +168,16 @@ def train():
     # Resume from the latest checkpoint if one exists, instead of always
     # training from scratch. Also carries the training-history CSVs
     # forward so plots/analysis over the full run stay contiguous.
+    # model.load raises if save_optimizer is set and the checkpoint has
+    # no Adam state; that stops training (no fallback).
     # ------------------------------------------------------------------
     resume_data, resume_agent_reward = [], []
-    if model.load(dirs2['model']):
+    if model.load(model_dir):
         resumed_step = model.cur_step
         if resumed_step >= total_step:
             print(">>> Checkpoint already at step %d >= target total_step %d; nothing to do." %
                   (resumed_step, total_step), flush=True)
+            print('>>> TRAINING COMPLETE step %d' % resumed_step, flush=True)
             return
         global_counter.resume(resumed_step)
         # The LR/entropy scheduler is a plain Python object, not a saved TF
@@ -115,37 +186,42 @@ def train():
         # sawtoothing the learning rate instead of decaying smoothly across
         # a multi-session run. Units match: both count cumulative env steps.
         model.lr_scheduler.n = resumed_step
-        train_csv_path = store_dir + '/train_reward.csv'
-        agent_csv_path = store_dir + '/agent_reward.csv'
-        if os.path.exists(train_csv_path):
-            resume_data = pd.read_csv(train_csv_path, index_col=0).to_dict('records')
-        if os.path.exists(agent_csv_path):
-            arr = np.loadtxt(agent_csv_path, delimiter=',')
-            if arr.ndim == 1:
-                arr = arr.reshape(1, -1)
-            resume_agent_reward = list(arr)
+        # seed_continue (spec section 7): the run's episode k trains on seed + k - 1 across
+        # resumes too, so a full run uses each training seed once. reset() then increments it.
+        if config.getboolean('ENV_CONFIG', 'seed_continue', fallback=False):
+            env.seed = seed + resumed_step // int(env.T)
+            logging.info('Resume: training seeds continue at %d' % env.seed)
+        resume_data, resume_agent_reward = _read_resume_history(store, resumed_step)
         print(">>> Resumed from checkpoint at step %d (target total_step: %d); carried forward %d prior episode(s)." %
               (resumed_step, total_step, len(resume_data)), flush=True)
     else:
         print(">>> No existing checkpoint found; starting training from scratch.", flush=True)
 
-    summary_writer = tf.summary.FileWriter(dirs2['log'])
-    trainer = Trainer(env, model, problem, global_counter, summary_writer, in_test, output_path=dirs['data'])
-    if resume_data:
-        trainer.data = resume_data
-        trainer.agent_reward = resume_agent_reward
+    summary_writer = tf.summary.FileWriter(log_dir)
+    sampler = None
+    if rq2:
+        sampler = MemorySampler()
+        sampler.start()
+    trainer = Trainer(env, model, problem, global_counter, summary_writer, in_test,
+                      store_dir=store, strict_save=rq2, sampler=sampler)
+    trainer.data = resume_data
+    trainer.agent_reward = resume_agent_reward
     print(">>> Starting trainer.run() — first episode loading SUMO...", flush=True)
-    trainer.run()
+    try:
+        trainer.run()
+    finally:
+        if sampler is not None:
+            sampler.stop()
 
-    # post-training test
-    if post_test:
-        tester = Tester(env, model, problem, global_counter, summary_writer, dirs['data'])
-        tester.run_offline(dirs['data'])
-
-    # save model
+    # save model, unless the per-episode loop already saved this step
     final_step = global_counter.cur_step
-    logging.info('Training: save final model at step %d ...' % final_step)
-    model.save(dirs2['model'], final_step)
+    if trainer.last_saved_step == final_step:
+        logging.info('Training: final model already saved at step %d' % final_step)
+    else:
+        logging.info('Training: save final model at step %d ...' % final_step)
+        model.save(model_dir, final_step)
+    summary_writer.close()
+    print('>>> TRAINING COMPLETE step %d' % final_step, flush=True)
 
 
 def evaluate_fn(agent, output_dir, seeds, port, demo, policy_type):
@@ -304,6 +380,13 @@ def evaluate():
         thread.join()
 
 
+def evaluate_sweep(spec):
+    """Evaluate run spec.name at its demand levels (spec section 8)."""
+    raise SystemExit('evaluate_sweep: implemented in Task 11')
+
+
+# Defaults for the RQ1 functions (evaluate, run_greedy, get_parameter); main() sets
+# default_config_dir, default_store_dir and option from the command line before dispatch.
 default_config_dir = './config/config_ma2c_Malta.ini'
 scenario = 'Malta'
 
@@ -323,12 +406,31 @@ else:
     default_store_dir = default_base_dir + '/' + problem
 
 
-if __name__ == '__main__':
+def main(argv=None):
+    """python main.py --run <name> [--option train|evaluate] [--levels 1.10,2.00]
+    or            python main.py --rq1 [--option train|evaluate|train_then_evaluate|greedy|get_parameter]
+
+    Without --run or --rq1 it refuses (exit 2). Returns 0; refusals and errors exit through
+    SystemExit.
+    """
+    global default_config_dir, default_store_dir, option
+    spec = parse_args(sys.argv[1:] if argv is None else argv)
+    option = spec.option
+    default_config_dir = spec.config_path
+    default_store_dir = spec.store_dir.rstrip('/')  # the RQ1 functions add '/...' themselves
+
+    if not spec.rq1:
+        if option == 'train':
+            train(spec)
+        elif option == 'evaluate':
+            evaluate_sweep(spec)
+        return 0
+
     if option == 'train':
-        train()
+        train(spec)
     elif option == 'train_then_evaluate':
         print(">>> Stage 1/2: training...", flush=True)
-        train()
+        train(spec)
         print(">>> Stage 2/2: evaluating freshly-trained model...", flush=True)
         evaluate()
         print(">>> train_then_evaluate complete.", flush=True)
@@ -338,3 +440,8 @@ if __name__ == '__main__':
         run_greedy()
     elif option == 'get_parameter':
         get_parameter(scenario)
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
