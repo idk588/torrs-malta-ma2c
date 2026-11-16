@@ -1,0 +1,4 @@
+# Smoke queue, run before the real queue
+_smoke_hybrid
+_smoke_fog
+_smoke_cloud

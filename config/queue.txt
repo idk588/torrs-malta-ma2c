@@ -1,0 +1,4 @@
+# RQ2 training queue, run in order
+cloud_base
+fog_base
+hybrid_base
