@@ -35,6 +35,11 @@ function Put([string]$Path, [string]$Text) {
     [IO.File]::WriteAllText($Path, $Text, $Utf8)
 }
 
+function Get-SharedTextOrEmpty([string]$Path) {
+    if ([IO.File]::Exists($Path)) { return (Read-SharedText $Path) }
+    ''
+}
+
 $SmokeIni = @'
 [MODEL_CONFIG]
 save_optimizer = true
@@ -162,6 +167,26 @@ try {
     Check ((Get-EvalTimeoutReason $t0.AddMinutes(241) $t0 $false $null 240 150) -match 'no EVAL_LEVEL_START') 'pre-level phase over 240 min'
     Check ((Get-EvalTimeoutReason $t0.AddMinutes(151) $t0 $true '2.00' 240 150) -match 'level f2\.00 exceeded') 'level over its limit'
     Check ($null -eq (Get-EvalTimeoutReason $t0.AddMinutes(149) $t0 $true '2.00' 240 150)) 'level within its limit'
+
+    # Refusals (fix round 1): exit 2 or 4 AND main.py's refusal text at the end of the log.
+    $abortTail = "2026-11-16 10:00:00,000 [INFO] step 100`r`nFatal Python error: Aborted`r`n`r`nCurrent thread 0x00001234 (most recent call first):`r`n  File `"main.py`", line 1 in <module>`r`n"
+    Check (-not (Test-RefusalExit 3 $abortTail)) 'exit 3 from a native abort is not a refusal'
+    Check (-not (Test-RefusalExit 3 'refusing to write into RQ1 store Malta/signal_route/ without --rq1')) 'exit 3 is never a refusal'
+    Check (Test-RefusalExit 4 "x`r`nresume refused for Malta/runs/fog_base/: config differs: ENV_CONFIG.seed`r`n") 'exit 4 with the resume refusal'
+    Check (Test-RefusalExit 4 'evaluate refused for Malta/runs/fog_base/: neighbour hash differs: stored=a current=b') 'exit 4 with the evaluate refusal'
+    Check (-not (Test-RefusalExit 4 "Traceback (most recent call last):`r`nOSError: disk`r`n")) 'exit 4 without the refusal text'
+    Check (Test-RefusalExit 2 "invalid run name: 'X'`r`n") 'exit 2: invalid run name'
+    Check (Test-RefusalExit 2 "refusing: invalid eval_levels '1,x'") 'exit 2: refusing'
+    Check (Test-RefusalExit 2 'main.py: error: argument --option: invalid choice') 'exit 2: argparse error'
+    Check (-not (Test-RefusalExit 2 "Traceback (most recent call last):`r`nValueError: something odd`r`n")) 'exit 2 without the refusal text'
+    Check (-not (Test-RefusalExit 2 ("refusing: x`r`n" + (((1..6) | ForEach-Object { "later line $_" }) -join "`r`n")))) 'refusal text far above the end of the log does not count'
+    Check (-not (Test-RefusalExit 6 'refusing: another main.py --run is running (pid 5)')) 'exit 6 is not a refusal'
+    Check (-not (Test-RefusalExit $null 'refusing: x')) 'no exit code'
+    Check (Test-MemoryErrorText 'OSError: [WinError 1455] The paging file is too small for this operation to complete') 'paging file text'
+    Check (Test-MemoryErrorText 'numpy.core._exceptions._ArrayMemoryError: MemoryError: Unable to allocate 1.2 GiB') 'MemoryError text'
+    Check (Test-MemoryErrorText 'ResourceExhaustedError: OOM ... out of memory') 'out of memory text'
+    Check (-not (Test-MemoryErrorText "ModuleNotFoundError: No module named 'tensorflow'")) 'an import error is not a memory error'
+    Check (-not (Test-MemoryErrorText $null)) 'no text'
 
     $smokeCfg = [pscustomobject]@{ TotalStep = 288; T = 144; Seed = 12; TestSeeds = [int[]]@(10000, 20000); EvalLevels = [double[]]@(1.0, 1.1) }
     $ta = Get-TrafficCheckArgs $smokeCfg
@@ -493,6 +518,27 @@ def episode(step, seed, reward):
     append(store + 'episode_cost.csv', '%d,%d,%d,1.0,600.0,0.5,0.1,1.0,1.0,1.0,1.0,0' % (step // 144, step, seed), COST)
     logging.info('Checkpoint saved at step %d -> %smodel/' % (step, store))
 if opt == 'train':
+    if os.path.exists(store + 'model/checkpoint-288.index'):
+        print('>>> TRAINING COMPLETE step 288', flush=True)
+        sys.exit(0)
+    if 'refuse' in run:
+        print('resume refused for %s: config differs: ENV_CONFIG.seed' % store, file=sys.stderr, flush=True)
+        sys.exit(4)
+    if 'abort' in run and not os.path.exists(store + 'died_once'):
+        open(store + 'died_once', 'w').write('x')
+        sys.stderr.write('Fatal Python error: Aborted\n\nCurrent thread 0x00001234 (most recent call first):\n  File "main.py", line 1 in <module>\n')
+        sys.stderr.flush()
+        os._exit(3)
+    if 'exittwo' in run and not os.path.exists(store + 'died_once'):
+        open(store + 'died_once', 'w').write('x')
+        print('ValueError: something odd in the env', file=sys.stderr, flush=True)
+        sys.exit(2)
+    if 'late' in run:
+        episode(144, 12, '-12.5')
+        time.sleep(6)
+        episode(288, 13, '-11.0')
+        time.sleep(60)
+        sys.exit(0)
     if 'hang' in run:
         time.sleep(120)
         sys.exit(0)
@@ -558,6 +604,10 @@ print('>>> EVALUATE COMPLETE levels=%d' % len(levels), flush=True)
         Put (Join-Path $sim 'config\queue_d.txt') "_smoke_stop`n"
         Put (Join-Path $sim 'config\queue_e.txt') "_smoke_slow`n"
         Put (Join-Path $sim 'config\queue_f.txt') "_smoke_adopt`n"
+        foreach ($r in '_smoke_abort', '_smoke_exittwo', '_smoke_refuse', '_smoke_late', '_smoke_envmem') { Put (Join-Path $sim ('config\runs\' + $r + '.ini')) $SmokeIni }
+        Put (Join-Path $sim 'config\queue_i.txt') "_smoke_abort`n_smoke_exittwo`n_smoke_refuse`n"
+        Put (Join-Path $sim 'config\queue_j.txt') "_smoke_late`n"
+        Put (Join-Path $sim 'config\queue_k.txt') "_smoke_envmem`n"
         Put (Join-Path $sim 'Malta\runs\_queue\state.json') '{ "version": 1, "runs": {}, "arms": { "fog": { "peak_commit_gb": 0.5 }, "cloud": { "peak_commit_gb": 0.5, "first_checkpoint_min": 0.05 }, "hybrid": { "peak_commit_gb": 0.5 }, "local": { "peak_commit_gb": 0.5, "first_checkpoint_min": 0.05 } } }'
 
         $drive = {
@@ -688,7 +738,92 @@ print('>>> EVALUATE COMPLETE levels=%d' % len(levels), flush=True)
         Check ($ql -match 'runner exits: QUEUE_DONE' -and ($ql -match 'no scheduled task of this queue found to disable' -or $ql -match 'cannot list scheduled tasks')) 'runner exit and the task step are logged'
         Check ((Get-MutexProbe) -match '^free') 'the runner released its mutex'
 
-        foreach ($r in '_smoke_fake', '_smoke_hang', '_smoke_nan', '_smoke_stop', '_smoke_slow', '_smoke_adopt') { Check (-not (Test-RunProcessAlive $r)) "no python of $r is left alive" }
+        # --- Fix round 1 -------------------------------------------------------------------
+        # 1. Exit codes: a native abort (exit 3) and an exit 2 without main.py's refusal text are
+        #    counted deaths and relaunched; exit 4 with the refusal text is FAILED (REFUSED).
+        $res = & $drive 'queue_i.txt'
+        Check ($res.Action -eq 'TERMINAL' -and $res.Status -eq 'FAILED' -and $res.Detail -match '_smoke_refuse \(REFUSED\)') "queue I ends FAILED (REFUSED) at _smoke_refuse: $($res.Status) $($res.Detail)"
+        foreach ($pair in @(@('_smoke_abort', 3), @('_smoke_exittwo', 2))) {
+            $rs = Join-Path $sim ('Malta\runs\' + $pair[0])
+            Check ((Read-ExitCode (Join-Path $rs 'logs\launch_r1.exit')) -eq $pair[1]) "$($pair[0]) launch_r1 exited $($pair[1])"
+            Check ([IO.File]::Exists((Join-Path $rs 'logs\launch_r2.log')) -and [IO.File]::Exists((Join-Path $rs 'DONE')) -and -not [IO.File]::Exists((Join-Path $rs 'FAILED'))) "$($pair[0]) was relaunched and finished"
+            $rc = (Read-QueueState (Join-Path $sim 'Malta\runs\_queue'))['runs'][$pair[0]]
+            Check ($rc['launches'] -eq 1 -and $rc['no_progress'] -eq 1 -and $rc['interrupted'] -eq 0) "$($pair[0]) counted one death: $(ConvertTo-Json $rc -Compress -Depth 5)"
+        }
+        $rf = Join-Path $sim 'Malta\runs\_smoke_refuse'
+        Check ((Get-MarkerFirstLine (Join-Path $rf 'FAILED')) -eq 'REFUSED' -and -not [IO.File]::Exists((Join-Path $rf 'logs\launch_r2.log'))) 'exit 4 with the refusal text: FAILED (REFUSED), no relaunch'
+        Check ((Get-MarkerLine (Join-Path $rf 'FAILED') 1) -match 'resume refused for') 'the FAILED detail quotes the refusal'
+
+        # 2. STOP present when a live launch is adopted: wait for its NEXT checkpoint (288), not
+        #    the ones already in its log (144).
+        Initialize-RunnerContext -ProjectRoot $sim -QueueFile 'config/queue_j.txt' -PythonExe $py -DryRun $false
+        $Q.EnvOk = $true
+        $lj = Start-RunnerLaunch '_smoke_late' (Read-RunConfig (Get-RunIniPath '_smoke_late')) 'TRAIN' $null (Read-QueueState $Q.QueueDir) (Get-CodeHashLines '_smoke_late')
+        $deadline = (Get-Date).AddSeconds(20)
+        while ((Get-Date) -lt $deadline -and -not ((Get-SharedTextOrEmpty $lj.Log) -match 'step 144 ->')) { Start-Sleep -Milliseconds 200 }
+        Check ((Get-SharedTextOrEmpty $lj.Log) -match 'Checkpoint saved at step 144 ->' -and (Get-SharedTextOrEmpty $lj.Log) -notmatch 'step 288 ->') 'the launch to adopt has saved checkpoint 144 only'
+        Put $stopFile 'stop'
+        $res = & $drive 'queue_j.txt'
+        Check ($res.Action -eq 'STOPPED') "STOP with an adopted launch stops the runner: $($res.Action) $($res.Detail)"
+        Check ((Get-GoodCheckpoint $sim '_smoke_late') -eq 288 -and (Read-SharedText $lj.Log) -match 'Checkpoint saved at step 288 ->') 'the adopted launch was killed after its next checkpoint (288), not at 144'
+        Remove-Item -LiteralPath $stopFile
+        $res = & $drive 'queue_j.txt'
+        Check ($res.Status -eq 'QUEUE_DONE' -and [IO.File]::Exists((Join-Path $sim 'Malta\runs\_smoke_late\logs\launch_r2.log'))) "after STOP is removed the adopted run finishes: $($res.Status)"
+
+        # 3. Heartbeats: during a long check, in a failed watch poll, while waiting for the port.
+        Initialize-RunnerContext -ProjectRoot $sim -QueueFile 'config/queue_k.txt' -PythonExe $py -DryRun $false
+        $statusFile = Join-Path $sim 'Malta\runs\_queue\status.txt'
+        $RunnerCheckStatusSec = 1
+        $r = Invoke-DetachedPython '-c "import time; time.sleep(2.5)"' 'slow_check' 60 'TESTCHECK'
+        Check ($r.Code -eq 0 -and (Read-SharedText $statusFile) -match '^TESTCHECK slow_check: running for \d+ s \(limit 60 s\) \| heartbeat ') "status during a long check: $(Read-SharedText $statusFile)"
+        $RunnerCheckStatusSec = 30
+        $wj = New-JobRecord -RunName '_smoke_envmem' -Cfg $smokeCfg -Kind 'train' -N 7 -Started (Get-Date) -CmdPid $null -PyPid 1 -GoodBefore -1 -Levels $null
+        try { throw 'simulated poll failure' } catch { Write-WatchError $wj $_ }
+        Check ((Read-SharedText $statusFile) -match '^TRAINING _smoke_envmem launch_r7: poll failed, retrying in 1 s: simulated poll failure.* \| heartbeat ') "status after a failed poll: $(Read-SharedText $statusFile)"
+        $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
+        $listener.Start()
+        try {
+            $lport = ([System.Net.IPEndPoint]$listener.LocalEndpoint).Port
+            Check (-not (Wait-PortFree $lport 2)) 'a listening port is not free after the wait'
+            Check ((Read-SharedText $statusFile) -match ('^CLEANUP waiting up to 2 s for TCP {0} to be free' -f $lport)) "status while waiting for the port: $(Read-SharedText $statusFile)"
+        } finally { $listener.Stop() }
+        Check (Wait-PortFree $lport 2) 'the port is free once the listener stops'
+
+        # 4. The environment check runs only after the preflight passed; a memory error in it
+        #    waits (WAITING_MEMORY), any other failure is ENV_ERROR.
+        $origEnvArgs = $RunnerEnvCheckArgs
+        try {
+            $RunnerEnvCheckArgs = '-c "import sys; print(''ModuleNotFoundError: No module named tensorflow''); sys.exit(1)"'
+            $logBefore = ([regex]::Matches((Read-SharedText (Join-Path $sim 'Malta\runs\_queue\queue.log')), 'environment check failed')).Count
+            Initialize-RunnerContext -ProjectRoot $sim -QueueFile 'config/queue_h.txt' -PythonExe $py -DryRun $false
+            $out = @(Invoke-RunnerIteration)
+            Check ($out.Count -eq 1 -and $out[0].Status -eq 'WAITING_MEMORY' -and $out[0].Detail -match 'peak 100000' -and -not $Q.EnvOk) "a failed preflight waits before any environment check: $($out[0].Status) $($out[0].Detail)"
+            Check (([regex]::Matches((Read-SharedText (Join-Path $sim 'Malta\runs\_queue\queue.log')), 'environment check failed')).Count -eq $logBefore) 'the environment check did not run'
+            foreach ($memText in 'MemoryError: Unable to allocate 1.2 GiB', 'OSError: [WinError 1455] The paging file is too small for this operation to complete') {
+                $RunnerEnvCheckArgs = '-c "import sys; print(''' + $memText + '''); sys.exit(1)"'
+                Initialize-RunnerContext -ProjectRoot $sim -QueueFile 'config/queue_k.txt' -PythonExe $py -DryRun $false
+                $out = @(Invoke-RunnerIteration)
+                Check ($out.Count -eq 1 -and $out[0].Action -eq 'WAIT' -and $out[0].Status -eq 'WAITING_MEMORY' -and $out[0].Detail -match 'environment check hit a memory error' -and -not $Q.EnvOk) "a memory error in the environment check waits: $($out[0].Status) $($out[0].Detail)"
+            }
+            $RunnerEnvCheckArgs = '-c "import sys; print(''ModuleNotFoundError: No module named tensorflow''); sys.exit(1)"'
+            Initialize-RunnerContext -ProjectRoot $sim -QueueFile 'config/queue_k.txt' -PythonExe $py -DryRun $false
+            $out = @(Invoke-RunnerIteration)
+            Check ($out.Count -eq 1 -and $out[0].Action -eq 'TERMINAL' -and $out[0].Status -eq 'ENV_ERROR' -and $out[0].Detail -match 'No module named tensorflow') "any other environment failure is ENV_ERROR: $($out[0].Status) $($out[0].Detail)"
+            Check (-not [IO.Directory]::Exists((Join-Path $sim 'Malta\runs\_smoke_envmem\logs'))) 'nothing was launched for _smoke_envmem'
+        } finally { $RunnerEnvCheckArgs = $origEnvArgs }
+
+        # 5. TCP 27500 still busy after the cleanup wait -> WAITING_PORT_BUSY, nothing launched.
+        $origCleanup = ${function:Invoke-RunnerCleanup}
+        try {
+            ${function:Invoke-RunnerCleanup} = { $false }
+            Initialize-RunnerContext -ProjectRoot $sim -QueueFile 'config/queue_k.txt' -PythonExe $py -DryRun $false
+            $Q.EnvOk = $true
+            $out = @(Invoke-RunnerIteration)
+            Check ($out.Count -eq 1 -and $out[0].Action -eq 'WAIT' -and $out[0].Status -eq 'WAITING_PORT_BUSY') "a busy port after cleanup waits: $($out[0].Status) $($out[0].Detail)"
+            Check (-not [IO.Directory]::Exists((Join-Path $sim 'Malta\runs\_smoke_envmem\logs'))) 'nothing was launched while the port was busy'
+        } finally { ${function:Invoke-RunnerCleanup} = $origCleanup }
+
+        foreach ($r in '_smoke_fake', '_smoke_hang', '_smoke_nan', '_smoke_stop', '_smoke_slow', '_smoke_adopt', '_smoke_abort', '_smoke_exittwo', '_smoke_refuse', '_smoke_late', '_smoke_envmem') { Check (-not (Test-RunProcessAlive $r)) "no python of $r is left alive" }
     }
 
     Write-Output ("ALL RUN_QUEUE TESTS PASSED ({0} checks)" -f $script:Asserts)

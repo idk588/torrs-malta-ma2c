@@ -29,9 +29,11 @@ One pass of the loop (Invoke-RunnerIteration; every pass re-reads the queue file
        EVALUATE  evaluate (only the failed levels on the one retry);
        TRAIN     Invoke-Recovery (NEEDS_REVIEW -> FAILED), then train.
      Before a launch: code hashes (a change against the run's first launch -> FAILED
-     CODE_CHANGED), the environment check (once per runner process, one retry after 60 s;
-     failure -> ENV_ERROR, terminal), the preflight (a failed check -> WAITING_<reason>,
-     re-checked every 5 min), cleanup, the launch, the watch, the completion.
+     CODE_CHANGED), the preflight (a failed check -> WAITING_<reason>, re-checked every
+     5 min), then the environment check (once per runner process, one retry after 60 s; a
+     memory error in its output -> WAITING_MEMORY; other failures -> ENV_ERROR, terminal),
+     cleanup (TCP 27500 still busy after 2 min -> WAITING_PORT_BUSY), the launch, the watch,
+     the completion. Long checks rewrite status.txt every 30 s.
   5. Every run DONE -> QUEUE_DONE (terminal).
   Every pass is wrapped in a catch-all: an exception is logged, the status shows ERROR, the
   runner sleeps 60 s and tries again. Only the terminal states (QUEUE_DONE, FAILED, STUCK,
@@ -86,8 +88,11 @@ Watch (one poll every 60 s; the log is read from a saved byte offset with shared
 Deviations from the spec text, on purpose
   - Cleanup kills duarouter.exe and randomTrips python under Malta\data only when they are
     orphans or children of a main.py python, never another job's (gen_traffic.py) children.
-  - main.py exit codes 2, 3 and 4 (bad arguments, RQ1 path, config or neighbour-hash
-    mismatch) mark the run FAILED (REFUSED) at once: a relaunch cannot fix them.
+  - A training launch that exits 2 or 4 with main.py's refusal message at the end of its log
+    (bad arguments; config or neighbour-hash mismatch) marks the run FAILED (REFUSED) at once:
+    a relaunch cannot fix it. Exit 3 is never a refusal here (python -X faulthandler returns 3
+    on any native abort), and neither is an exit 2 or 4 without the message: both are ordinary
+    deaths for the counters.
   - A STOP kill counts toward the 12-launch cap but not toward the 3 launches without
     progress (it is passed to Update-LaunchCounters as an interruption).
   - An evaluation ended by a reboot or logoff is not counted as an attempt (like STOP); a cap
@@ -126,13 +131,22 @@ $RunnerEvalLevelDefaultMin = 360.0
 $RunnerSaveErrorGraceSec = 120
 $RunnerStopGraceSec = 15
 $RunnerPortWaitSec = 120
+$RunnerCheckStatusSec = 30
 $RunnerWrapperWaitSec = 30
 $RunnerPythonFindSec = 30
 $RunnerEnvTimeoutSec = 600
 $RunnerTrafficTimeoutSec = 1800
 $RunnerMaxEvalAttempts = 2
 $RunnerMaxEvalLaunches = 6
-$RunnerRefusalExitCodes = @(2, 3, 4)
+# main.py refusals that a relaunch cannot fix: exit 2 (run_config.parse_args / main._refuse:
+# 'invalid ...', 'refusing: ...', argparse 'main.py: error: ...') and exit 4 (run_config
+# .prepare_store 'resume refused for ...', main 'evaluate refused for ...'). Exit 3 (the RQ1
+# path) is not here: queue stores are always under Malta\runs, and 3 is also what python
+# -X faulthandler returns on any native abort, which must be relaunched.
+$RunnerRefusalPatterns = @{
+    2 = '(?:^|\s)(?:refusing: |invalid: |invalid run name: |invalid --levels: |main\.py: error: )'
+    4 = '(?:^|\s)(?:resume|evaluate) refused for '
+}
 $RunnerCodeFiles = @('main.py', 'utils.py', 'run_config.py', 'run_files.py', 'Malta\build_file.py')
 $RunnerCodeDirs = @('agents', 'envs')
 $RunnerBusyExeNames = @('sumo.exe', 'sumo-gui.exe', 'duarouter.exe', 'netconvert.exe')
@@ -348,6 +362,19 @@ function Get-TrafficCheckArgs($Cfg) {
         Train = 'tools/gen_traffic.py --seeds {0}-{1} --factors 1.0 --check-only' -f $first, ($first + $episodes - 1)
         Test  = 'tools/gen_traffic.py --seeds {0} --factors {1} --check-only' -f (@($Cfg.TestSeeds) -join ','), $levels
     }
+}
+
+function Test-RefusalExit($ExitCode, [string]$LogTail) {
+    # Whether a launch ended in a main.py refusal: exit 2 or 4 AND, among the last 5 non-empty
+    # lines of its log, main.py's refusal message for that code. Anything else (exit 3 from a
+    # native abort, an exit 2 or 4 without the message) is an ordinary death for the counters.
+    if ($null -eq $ExitCode) { return $false }
+    $code = [long]$ExitCode
+    if (-not ($code -eq 2 -or $code -eq 4)) { return $false }
+    $pattern = $RunnerRefusalPatterns[[int]$code]
+    $lines = @(([string]$LogTail -split "`r?`n") | Where-Object { $_.Trim().Length -gt 0 } | Select-Object -Last 5)
+    foreach ($l in $lines) { if ($l -match $pattern) { return $true } }
+    $false
 }
 
 function Get-ArmSetting($State, [string]$Arm, [string]$Key, [double]$Default) {
@@ -692,10 +719,23 @@ function Test-CleanupTarget($Proc, $ById) {
     ([string]$parent.CommandLine) -match '(?:^|[\s"''\\/])main\.py(?:["''\s]|$)'
 }
 
+function Wait-PortFree([int]$Port, [int]$TimeoutSec) {
+    # Up to $TimeoutSec for the port to be free (Test-PortFree), with a status heartbeat while
+    # waiting. -> $true when free.
+    $deadline = (Get-Date).AddSeconds($TimeoutSec)
+    while (-not (Test-PortFree $Port)) {
+        if ((Get-Date) -ge $deadline) { return $false }
+        Write-RunnerStatus 'CLEANUP' ('waiting up to {0} s for TCP {1} to be free' -f $TimeoutSec, $Port)
+        Start-Sleep -Seconds ([Math]::Min(5, [Math]::Max(1, $TimeoutSec)))
+    }
+    $true
+}
+
 function Invoke-RunnerCleanup {
     # Spec 9 cleanup, run when no queue python is alive and before every launch: SUMO on the
     # queue's TraCI port, orphaned duarouter / randomTrips under Malta\data, stale queue
-    # wrappers; then up to 2 min for port 27500 to be free.
+    # wrappers; then up to 2 min for port 27500 to be free. -> $true when the port is free
+    # (callers that only clean up discard it with [void]).
     $table = @(Get-ProcessTable)
     $byId = @{}
     foreach ($p in $table) { $byId[[int]$p.ProcessId] = $p }
@@ -712,8 +752,7 @@ function Invoke-RunnerCleanup {
             if ($kids.Count -eq 0) { Stop-ProcessTree $id 'stale queue wrapper (its python is gone)' }
         }
     }
-    $deadline = (Get-Date).AddSeconds($RunnerPortWaitSec)
-    while (-not (Test-PortFree $QueueTrainPort) -and (Get-Date) -lt $deadline) { Start-Sleep -Seconds 5 }
+    Wait-PortFree $QueueTrainPort $RunnerPortWaitSec
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -733,18 +772,27 @@ function Test-ProcessAlive([int]$Id) {
     $null -ne (Get-Process -Id $Id -ErrorAction SilentlyContinue)
 }
 
-function Invoke-DetachedPython([string]$PythonArgs, [string]$Name, [int]$TimeoutSec) {
-    # Runs '<python> <args>' through the launch wrapper and waits for it.
+function Invoke-DetachedPython([string]$PythonArgs, [string]$Name, [int]$TimeoutSec, [string]$Status = 'CHECKING') {
+    # Runs '<python> <args>' through the launch wrapper and waits for it, rewriting status.txt
+    # (state $Status) every $RunnerCheckStatusSec so a slow check never looks like a dead runner.
     # -> { Code (Int64 or $null); Output; TimedOut }
     $out = Join-Path $Q.ChecksDir ($Name + '.out')
     $exit = Join-Path $Q.ChecksDir ($Name + '.exit')
     Write-Utf8NoBom $exit "PENDING`r`n"
     Write-Utf8NoBom $out ''
+    $started = Get-Date
+    Write-RunnerStatus $Status ('{0}: started {1}' -f $Name, (Format-Stamp $started))
     $cmdPid = Start-Detached (New-DetachedCommandLine $Q.Python $PythonArgs $out $exit)
-    $deadline = (Get-Date).AddSeconds($TimeoutSec)
+    $deadline = $started.AddSeconds($TimeoutSec)
+    $nextStatus = $started.AddSeconds($RunnerCheckStatusSec)
     $timedOut = $false
     while (Test-ProcessAlive $cmdPid) {
-        if ((Get-Date) -gt $deadline) { $timedOut = $true; Stop-ProcessTree $cmdPid "$Name timed out"; break }
+        $now = Get-Date
+        if ($now -gt $deadline) { $timedOut = $true; Stop-ProcessTree $cmdPid "$Name timed out"; break }
+        if ($now -ge $nextStatus) {
+            Write-RunnerStatus $Status ('{0}: running for {1} s (limit {2} s)' -f $Name, [int]($now - $started).TotalSeconds, $TimeoutSec)
+            $nextStatus = $now.AddSeconds($RunnerCheckStatusSec)
+        }
         Start-Sleep -Milliseconds 500
     }
     $text = ''
@@ -758,33 +806,47 @@ function Get-TextTail([string]$Text, [int]$Lines = 4) {
     ConvertTo-OneLine (($all | Select-Object -Last $Lines) -join "`n") 600
 }
 
+function Test-MemoryErrorText([string]$Text) {
+    # A failure caused by memory pressure (another program, a small pagefile), not by the
+    # environment: the runner then waits (WAITING_MEMORY) instead of stopping (ENV_ERROR).
+    if ([string]::IsNullOrEmpty($Text)) { return $false }
+    $Text -match '(?i)paging file is too small|MemoryError|out of memory'
+}
+
 function Test-RunnerEnvironment {
     # Spec 9: the training python imports tensorflow, traci and sumolib and sees SUMO_HOME,
     # launched the same detached way; sumo.exe exists under SUMO_HOME\bin.
-    $fail = { param([string]$m) [pscustomobject]@{ Ok = $false; Detail = $m } }
+    # -> { Ok; Memory (the failure text names a memory error); Detail }
+    $fail = { param([string]$m, [string]$Out = '') [pscustomobject]@{ Ok = $false; Memory = (Test-MemoryErrorText $Out); Detail = $m } }
     if (-not [IO.File]::Exists($Q.Python)) { return (& $fail "python not found: $($Q.Python)") }
-    $r = Invoke-DetachedPython $RunnerEnvCheckArgs 'env_check' $RunnerEnvTimeoutSec
-    if ($r.TimedOut) { return (& $fail "the environment check timed out after $RunnerEnvTimeoutSec s") }
-    if ($null -eq $r.Code) { return (& $fail ('the environment check wrote no exit code: ' + (Get-TextTail $r.Output))) }
-    if ($r.Code -ne 0) { return (& $fail ('the environment check exited {0}: {1}' -f $r.Code, (Get-TextTail $r.Output))) }
+    $r = Invoke-DetachedPython $RunnerEnvCheckArgs 'env_check' $RunnerEnvTimeoutSec 'CHECKING_ENVIRONMENT'
+    if ($r.TimedOut) { return (& $fail "the environment check timed out after $RunnerEnvTimeoutSec s" $r.Output) }
+    if ($null -eq $r.Code) { return (& $fail ('the environment check wrote no exit code: ' + (Get-TextTail $r.Output)) $r.Output) }
+    if ($r.Code -ne 0) { return (& $fail ('the environment check exited {0}: {1}' -f $r.Code, (Get-TextTail $r.Output)) $r.Output) }
     $m = [regex]::Matches($r.Output, '(?m)^SUMO_HOME=(.+?)\s*$')
-    if ($m.Count -eq 0) { return (& $fail ('no SUMO_HOME line: ' + (Get-TextTail $r.Output))) }
+    if ($m.Count -eq 0) { return (& $fail ('no SUMO_HOME line: ' + (Get-TextTail $r.Output)) $r.Output) }
     $sumoHome = $m[$m.Count - 1].Groups[1].Value.Trim()
     $sumo = Join-Path $sumoHome 'bin\sumo.exe'
     if (-not [IO.File]::Exists($sumo)) { return (& $fail "sumo.exe not found: $sumo") }
-    [pscustomobject]@{ Ok = $true; Detail = "tensorflow, traci, sumolib import; SUMO_HOME=$sumoHome; $sumo exists" }
+    [pscustomobject]@{ Ok = $true; Memory = $false; Detail = "tensorflow, traci, sumolib import; SUMO_HOME=$sumoHome; $sumo exists" }
 }
 
 function Confirm-RunnerEnvironment {
-    # The environment check, once per runner process, with one retry after 60 s.
-    if ($Q.EnvOk) { return [pscustomobject]@{ Ok = $true; Detail = 'checked earlier' } }
+    # The environment check, once per runner process, with one retry after 60 s. A failure
+    # whose output names a memory error returns at once with Memory = $true (the caller waits
+    # and re-checks); EnvOk stays false, so the next pass checks again.
+    if ($Q.EnvOk) { return [pscustomobject]@{ Ok = $true; Memory = $false; Detail = 'checked earlier' } }
     $e = $null
     for ($i = 1; $i -le 2; $i++) {
         Write-RunnerStatus 'CHECKING_ENVIRONMENT' "try $i of 2"
         $e = Test-RunnerEnvironment
         if ($e.Ok) { $Q.EnvOk = $true; Write-QueueLog ('environment check passed: ' + $e.Detail); return $e }
         Write-QueueLog ("environment check failed (try {0} of 2): {1}" -f $i, $e.Detail)
-        if ($i -lt 2) { Start-Sleep -Seconds $RunnerPollSeconds }
+        if ($e.Memory) { return $e }
+        if ($i -lt 2) {
+            Write-RunnerStatus 'CHECKING_ENVIRONMENT' ("try 1 of 2 failed; retrying in {0} s" -f $RunnerPollSeconds)
+            Start-Sleep -Seconds $RunnerPollSeconds
+        }
     }
     $e
 }
@@ -800,7 +862,7 @@ function Get-CommitBytes {
 
 function Invoke-TrafficCheck([string]$PythonArgs, [string]$Name, [hashtable]$Cache) {
     if ($Cache.ContainsKey($PythonArgs)) { return $Cache[$PythonArgs] }
-    $r = Invoke-DetachedPython $PythonArgs $Name $RunnerTrafficTimeoutSec
+    $r = Invoke-DetachedPython $PythonArgs $Name $RunnerTrafficTimeoutSec 'PREFLIGHT'
     $summary = Get-TextTail $r.Output 1
     $res = $null
     if ($r.TimedOut) { $res = [pscustomobject]@{ Ok = $false; Detail = "timed out after $RunnerTrafficTimeoutSec s" } }
@@ -889,7 +951,7 @@ function New-JobRecord {
         Offset = [long]0; CkptCount = 0; NewCkpt = 0; LastCkptTime = $null; LastCkptStep = -1
         FirstCkptMin = $null; MaxGapMin = 0.0; InTraceback = $false; SaveErrorAt = $null; NanDetail = $null
         PhaseStart = $Started; LevelSeen = $false; CurrentLevel = $null; LevelStarts = @{}; F100Min = $null; DoneLevels = 0
-        StopSince = $null; StopCkptBase = 0
+        StopSince = $null; StopCkptBase = 0; Adopted = $false; Polled = $false; AdoptCkptBase = 0
         EndReason = $null; EndDetail = $null; TimedOutLevel = $null; PeakCommitGB = 0.0
         FirstLimitMin = $RunnerFirstCheckpointMin; Rollouts = $null; StateF100 = $null
     }
@@ -1128,7 +1190,9 @@ function New-AdoptedJob([string]$RunName, $Proc, $ById, $State) {
         if ($null -ne $t) { $started = $t }
         if ($null -ne $cur['good_before']) { $good = [int]$cur['good_before'] }
     }
-    New-JobRecord -RunName $RunName -Cfg $cfg -Kind $kind -N $n -Started $started -CmdPid $cmdPid -PyPid ([int]$Proc.ProcessId) -GoodBefore $good -Levels $levels
+    $job = New-JobRecord -RunName $RunName -Cfg $cfg -Kind $kind -N $n -Started $started -CmdPid $cmdPid -PyPid ([int]$Proc.ProcessId) -GoodBefore $good -Levels $levels
+    $job.Adopted = $true
+    $job
 }
 
 function ConvertFrom-CurrentLaunch([string]$RunName, $Cur) {
@@ -1236,9 +1300,25 @@ function Get-JobStatus($Job) {
     '{0} {1} {2} ({3} level(s) done, python pid {4})' -f $Job.Run, $Job.Label, $lv, $Job.DoneLevels, $Job.PyPid
 }
 
+function Write-WatchError($Job, $ErrorRecord) {
+    # A failed poll of a watched job: logged, and status.txt still gets its heartbeat.
+    $msg = Format-RunnerError $ErrorRecord
+    Write-QueueLog ('watch error (job keeps running): ' + $msg)
+    $state = 'TRAINING'
+    if ($Job.Foreign) { $state = 'ADOPTED' }
+    elseif ($Job.Kind -eq 'evaluate') { $state = 'EVALUATING' }
+    Write-RunnerStatus $state ('{0} {1}: poll failed, retrying in {2} s: {3}' -f $Job.Run, $Job.Label, $RunnerPollSeconds, $msg)
+}
+
 function Step-RunnerJob($Job, $State) {
     # One poll of a watched job; sets $Job.EndReason when it has ended or was killed.
     Update-JobFromLog $Job $State
+    if (-not $Job.Polled) {
+        # An adopted job's first read covers its whole log: those checkpoints were saved before
+        # this runner watched it, so STOP waits for the next one (base = the count so far).
+        $Job.Polled = $true
+        if ($Job.Adopted) { $Job.AdoptCkptBase = $Job.CkptCount }
+    }
     $table = @(Get-ProcessTable)
     if (-not (Test-JobAlive $Job $table)) { $Job.EndReason = 'EXITED'; return }
     $gb = Get-JobCommitGB $Job $table
@@ -1265,9 +1345,10 @@ function Step-RunnerJob($Job, $State) {
     }
     if ($stop) {
         if ($null -eq $Job.StopSince) {
-            # A checkpoint read in this same poll counts as the one STOP waits for.
+            # A checkpoint read in this same poll counts as the one STOP waits for, unless it
+            # came from an adopted job's existing log.
             $Job.StopSince = $now
-            $Job.StopCkptBase = $Job.CkptCount - $Job.NewCkpt
+            $Job.StopCkptBase = [Math]::Max($Job.CkptCount - $Job.NewCkpt, $Job.AdoptCkptBase)
             Write-QueueLog ("{0}: STOP seen; waiting for the next checkpoint of {1} (at most {2} min)" -f $Job.Run, $Job.Label, $RunnerCheckpointGapMin)
         }
         if ($Job.CkptCount -gt $Job.StopCkptBase -or ($now - [datetime]$Job.StopSince).TotalMinutes -ge $RunnerCheckpointGapMin) {
@@ -1321,12 +1402,12 @@ function Watch-ForeignJob($Job) {
             if (-not $alive) { break }
             Write-RunnerStatus 'ADOPTED' ('{0}: python pid {1} not started by the queue' -f $Job.Run, $Job.PyPid)
             Set-KeepAwake $true
-        } catch { Write-QueueLog ('watch error (job keeps running): ' + (Format-RunnerError $_)) }
+        } catch { Write-WatchError $Job $_ }
         Start-Sleep -Seconds $RunnerPollSeconds
     }
     Set-KeepAwake $false
     Write-QueueLog ("{0}: python pid {1} (not started by the queue) has exited" -f $Job.Run, $Job.PyPid)
-    Invoke-RunnerCleanup
+    [void](Invoke-RunnerCleanup)
     New-RunnerResult 'CONTINUE'
 }
 
@@ -1344,7 +1425,7 @@ function Watch-RunnerJob($Job, $State) {
     Set-KeepAwake $true
     while ($null -eq $Job.EndReason) {
         try { Step-RunnerJob $Job $State }
-        catch { Write-QueueLog ('watch error (job keeps running): ' + (Format-RunnerError $_)) }
+        catch { Write-WatchError $Job $_ }
         if ($null -ne $Job.EndReason) { break }
         Start-Sleep -Seconds $RunnerPollSeconds
     }
@@ -1359,7 +1440,7 @@ function Complete-RunnerJob($Job, $State) {
     Write-RunnerStatus 'COMPLETING' ('{0} {1} ({2})' -f $Job.Run, $Job.Label, $Job.EndReason)
     Wait-JobWrapper $Job
     try { Update-JobFromLog $Job $State } catch { Write-QueueLog ('final log read failed: ' + $_.Exception.Message) }
-    Invoke-RunnerCleanup
+    [void](Invoke-RunnerCleanup)
     Save-JobMeasurements $Job $State
     if ($Job.Kind -eq 'evaluate') { return (Complete-EvalLaunch $Job $State) }
     Complete-TrainLaunch $Job $State
@@ -1397,10 +1478,14 @@ function Complete-TrainLaunch($Job, $State) {
         return (New-RunnerResult 'CONTINUE')
     }
     Write-QueueLog ("{0}: {1} ended without completing training: {2}; not complete because: {3}" -f $run, $Job.Label, (Get-LaunchSummary $Job $outcome), $tc.Reason)
-    if ($Job.EndReason -eq 'EXITED' -and $null -ne $outcome.ExitCode -and ($RunnerRefusalExitCodes -contains [long]$outcome.ExitCode)) {
-        $counters['current_launch'] = $null
-        Save-QueueState $Q.QueueDir $State
-        return (Set-RunFailed $run 'REFUSED' ('{0}: main.py exited {1}, a refusal a relaunch cannot fix; see {2}' -f $Job.Label, $outcome.ExitCode, $Job.Log))
+    if ($Job.EndReason -eq 'EXITED' -and $null -ne $outcome.ExitCode) {
+        $tail = ''
+        if ([IO.File]::Exists($Job.Log)) { $tail = Get-FileTail $Job.Log 4096 }
+        if (Test-RefusalExit $outcome.ExitCode $tail) {
+            $counters['current_launch'] = $null
+            Save-QueueState $Q.QueueDir $State
+            return (Set-RunFailed $run 'REFUSED' ('{0}: main.py refused (exit {1}: {2}), which a relaunch cannot fix; see {3}' -f $Job.Label, $outcome.ExitCode, (Get-TextTail $tail 1), $Job.Log))
+        }
     }
     Write-RunnerStatus 'RECOVERY' $run
     $rec = Invoke-Recovery $Q.Root $run $Job.Cfg $Q.QueueDir -Log { param($m) Write-QueueLog $m }
@@ -1510,8 +1595,6 @@ function Start-RunStep([string]$RunName, [string]$IniPath, $Cfg, [string]$Stage,
     }
     $code = Test-CodeHashes $RunName
     if (-not $code.Ok) { return (Set-RunFailed $RunName 'CODE_CHANGED' $code.Detail) }
-    $envCheck = Confirm-RunnerEnvironment
-    if (-not $envCheck.Ok) { return (New-RunnerResult 'TERMINAL' 'ENV_ERROR' $envCheck.Detail) }
     Write-RunnerStatus 'PREFLIGHT' $RunName
     $pf = Invoke-Preflight $RunName $Cfg (Get-RunArm $IniPath) $State
     if (-not $pf.Ok) {
@@ -1519,8 +1602,17 @@ function Start-RunStep([string]$RunName, [string]$IniPath, $Cfg, [string]$Stage,
         $bad = @($pf.Lines | Where-Object { -not $_.Ok } | ForEach-Object { $_.Name + ': ' + $_.Detail })
         return (New-RunnerResult 'WAIT' ('WAITING_' + $pf.Wait) ($RunName + ' ' + $Stage + ': ' + ($bad -join '; ')))
     }
+    # The environment check (a TensorFlow import) only after the preflight passed, so memory
+    # pressure from another program makes the runner wait instead of stopping (ENV_ERROR).
+    $envCheck = Confirm-RunnerEnvironment
+    if (-not $envCheck.Ok) {
+        if ($envCheck.Memory) { return (New-RunnerResult 'WAIT' 'WAITING_MEMORY' ($RunName + ' ' + $Stage + ': environment check hit a memory error: ' + $envCheck.Detail)) }
+        return (New-RunnerResult 'TERMINAL' 'ENV_ERROR' $envCheck.Detail)
+    }
     Write-RunnerStatus 'CLEANUP' $RunName
-    Invoke-RunnerCleanup
+    if (-not (Invoke-RunnerCleanup)) {
+        return (New-RunnerResult 'WAIT' 'WAITING_PORT_BUSY' ('{0} {1}: TCP {2} still busy after {3} s' -f $RunName, $Stage, $QueueTrainPort, $RunnerPortWaitSec))
+    }
     if ([IO.File]::Exists($Q.StopFile)) { return (New-RunnerResult 'STOPPED' 'STOPPED' 'STOP present; nothing launched') }
     $job = Start-RunnerLaunch $RunName $Cfg $Stage $levels $State $code.Lines
     Watch-RunnerJob $job $State
@@ -1548,7 +1640,7 @@ function Invoke-RunnerIteration {
 
     # 3. Cleanup and STOP.
     Write-RunnerStatus 'CLEANUP' ''
-    Invoke-RunnerCleanup
+    [void](Invoke-RunnerCleanup)
     if ([IO.File]::Exists($Q.StopFile)) { return (New-RunnerResult 'STOPPED' 'STOPPED' 'STOP present; nothing launched') }
 
     # 4. The runs, in order.
