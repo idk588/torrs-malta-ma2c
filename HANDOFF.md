@@ -1,6 +1,6 @@
 # Handoff: continuing TORRS on the home PC
 
-Written 6 November 2026, when the project moved from the laptop (Ryzen 5 5600H) to the home PC (Ryzen 7 7700X, 32 GB). Last updated 8 November 2026 (08:10), after the 100-episode background-traffic run and its evaluation finished. A new Claude Code session should read this file first, then `TORRS_Progress_and_Plan.docx` for the full list of what is done and left, and the weekly plan to 31 December 2026.
+Written 6 November 2026, when the project moved from the laptop (Ryzen 5 5600H) to the home PC (Ryzen 7 7700X, 32 GB). Last updated 16 November 2026, after the RQ2 training queue was built (it has not been launched yet; see "RQ2 training queue" below). A new Claude Code session should read this file first, then `TORRS_Progress_and_Plan.docx` for the full list of what is done and left, and the weekly plan to 31 December 2026.
 
 ## Where things stand
 
@@ -24,6 +24,7 @@ Written 6 November 2026, when the project moved from the laptop (Ryzen 5 5600H) 
   stats_compare excludes actuated_rerouting, which has no trip CSV.
 - **Baselines** on the background-traffic network, 10 seeds each, in `Malta/signal_route/baseline_data/`. fixed_static (the reference), actuated_static, fixed_rerouting and greedy are complete. actuated_rerouting has 9 of 10 seeds and no trip CSV, because a Windows Update restart killed it on 28 October; it needs re-running. Its folder holds only `trip_90000.xml` from that aborted run, which is not a result.
 - **Statistics:** `stats_compare.py` writes to `Malta/signal_route/stats/`. The `*_vs_ma2c.csv` files cover MA2C against greedy, fixed_static, fixed_rerouting and actuated_static (816ca94). The fixed_rerouting arm reads `baseline_data/fixed_rerouting/Malta_signal_route_trip.csv` (f4a3bc5). The comparisons against fixed_static there (also uncommitted) cover greedy and actuated_static only.
+- **RQ2 training queue: built, not launched.** The code, configs and queue runner for the cloud, fog and hybrid runs were finished on 16 November. The smoke queue and the author's gates come first; see "RQ2 training queue" below.
 - **Pace on the laptop:** about 57 min per training episode, plus about 70 min of TensorFlow start-up after every restart.
 - **Pace on the home PC:**
   - Training episodes: about 23 min each in episodes 87–100, and 28–31 min earlier.
@@ -46,28 +47,95 @@ Written 6 November 2026, when the project moved from the laptop (Ryzen 5 5600H) 
 
 ## Re-running the evaluation
 
-Training is finished, so `python main.py` (option `train_then_evaluate`, `total_step` 72000) skips training and only re-evaluates checkpoint-72000, overwriting `eva_data/`. Its `>>> train_then_evaluate complete.` line is printed even if the evaluation thread failed. Before trusting `eva_data/`, check the run log for:
+Training is finished, so `python main.py --rq1` (option `train_then_evaluate`, `total_step` 72000) skips training and only re-evaluates checkpoint-72000, overwriting `eva_data/`. Its `>>> train_then_evaluate complete.` line is printed even if the evaluation thread failed. Before trusting `eva_data/`, check the run log for:
 
 - `Checkpoint loaded: checkpoint-72000`
 - all ten `test N, avg reward` lines
 - no `Traceback` or `Exception in thread`
 
-Also check that the three CSVs are newly written. Evaluation log lines go to the run log and `Malta/signal_route/log/<epoch>.log`, not to `eva_log/`.
+Also check that the three CSVs are newly written. Evaluation log lines go to the run log and, since `init_log` now replaces the earlier log handler, to `Malta/signal_route/eva_log/<epoch>.log` (before the RQ2 changes they went to `log/<epoch>.log`).
+
+Since the RQ2 changes, `main.py` refuses to run without `--rq1` (or `--run <name>`), and nothing writes into `Malta/signal_route/` without `--rq1`. `eva_data/` is in the frozen part of the RQ1 manifest, so don't re-run the evaluation while the RQ2 queue exists, and after a re-run record the manifest again (`python tools/rq1_manifest.py record`).
 
 The crash-recovery supervisor (`claude_context/supervisor/train_supervisor.ps1`) is retired. `claude_context/supervisor/STOP` exists, and the "TORRS training supervisor" logon task was removed on 8 November. To use it for a future long run, delete STOP, edit the log prefix in the script, and run it detached.
 
+## RQ2 training queue
+
+Built between 12 and 16 November to the design in `docs/superpowers/specs/2026-11-08-rq2-training-queue-design.md` (the spec) and the plan `docs/superpowers/plans/2026-11-12-rq2-training-queue.md`. It trains the three RQ2 architectures one after the other, unattended: cloud (every agent sees every other agent), fog (every agent in the same NSO district) and hybrid (fog plus a 12-value district summary). It then evaluates each at 1.00, 1.06, 1.10, 1.13, 1.20 and 2.00× base demand; 1.10× is peak season. **It has not been launched yet:** no scheduled task is registered, and `Malta/runs/` holds only `_queue/`. Tasks 1–16 of the plan are done; Task 17 (smoke queue, author gates, launch) is next.
+
+**Runs.** `config/queue.txt` lists `cloud_base`, `fog_base` and `hybrid_base`, in that order. Each run's config is `config/runs/<name>.ini`: the RQ1 config with `comm_arch` (cloud, fog or hybrid), `reward_share = mean`, `coop_gamma_sr = 0`, `seed_continue = true`, `eval_levels`, `norm_summary_wait = 60` and `save_optimizer = true`; everything else, including `total_step = 72000` and `seed = 12`, is as in RQ1. A full run trains on seeds 12–111, once each. `config/queue_smoke.txt` lists the smoke runs `_smoke_hybrid`, `_smoke_fog` and `_smoke_cloud` (`config/runs/_smoke_<arm>.ini`: 2 episodes of 720 s, test seeds 10000 and 20000, levels 1.00 and 1.10). The spec estimates about 40 h of training plus 3–4 h of evaluation per run, about 5.5–6 days for all three, and about 1 h per restart.
+
+**Where runs live** (spec §3). Each run has its own store, `Malta/runs/<name>/`:
+- `config.ini`, `zones_nso.csv` and `neighbours.sha256`: copies of what the run used, written at its first launch. A resume or evaluation refuses (exit 4) if the run's config or neighbour maps differ from them.
+- `train_reward.csv` (with a `seed` column), `agent_reward.csv` and `episode_cost.csv` (per-episode time, peak memory and checkpoint size).
+- `eva_data/f1.00/` … `eva_data/f2.00/`: the evaluation CSVs per demand level. `eva_data/EVAL_OK` is written when every check passes; a failed level is moved to `eva_data/_failed_<stamp>/` before its retry.
+- `DONE` or `FAILED`: the runner's terminal marker.
+- `model/` (checkpoints), `logs/` (`launch_rN.log`, `eval_rN.log`, exit files, code hashes, python and TF logs) and `sim/` (SUMO files): gitignored.
+
+The runner never runs git. Commit a run's tracked files (the first four bullets) only within 10 minutes after a `Checkpoint saved` line or after the run's `DONE`. Smoke stores (`Malta/runs/_smoke_*/`) are gitignored.
+
+**`main.py`.** `python main.py --run <name> [--option train|evaluate] [--levels 1.10,2.00]`. With `--run`, `--option` is `train` (the default; it resumes from the newest checkpoint) or `evaluate` (all of the store config's `eval_levels`, or only `--levels`). Without `--run`, `main.py` refuses (exit 2) unless `--rq1` is given. **RQ1 guard:** any path in `Malta/signal_route/` is refused (exit 3) without `--rq1`, and `--rq1` cannot be combined with `--run`. Only one `main.py --run` may run at a time (exit 6). In normal use only the queue runs `main.py`.
+
+**The runner.** `tools/run_queue.ps1` (with its library `tools/queue_lib.ps1`) is started only by the scheduled task "TORRS training queue", never from a Claude shell. `tools/register_queue_task.ps1` registers the task (elevated PowerShell; it never starts it; `-DryRun` prints the definition, `-Unregister` removes it). The task runs at startup and at logon (2-minute delay), as kylea with S4U (whether or not anyone is logged on), and is restarted every 5 min, up to 99 times, if it fails. For each run in the queue file, the runner:
+- skips a `DONE` run and stops the whole queue at a `FAILED` one (a reboot never skips past it);
+- evaluates a run whose training is complete;
+- otherwise runs Recovery (moves half-saved checkpoints aside and trims the CSVs to the last good checkpoint; it never deletes) and trains.
+
+Before every launch it waits, with status `WAITING_<reason>` and a re-check every 5 min, until:
+- STOP is absent;
+- the machine is free: no other `main.py`, `baselines.py`, `ablation_routing.py`, `gen_traffic.py`, `build_zones.py`, randomTrips or Jupyter kernel; no SUMO, duarouter or netconvert outside the queue; TCP 27500 free;
+- the commit limit minus the current commit is at least the arm's smoke-test peak + 8 GB (60 + 8 GB until the smoke numbers are entered in `state.json`);
+- at least 60 GB is free on E: and 10 GB on C:;
+- every traffic file the queue needs is valid.
+
+A run is marked FAILED after 3 launches in a row without progress or 12 launches in all (STUCK), a non-finite reward (NAN), a code change since its first launch (CODE_CHANGED) or a second failed evaluation attempt (EVAL_FAILED). When the queue finishes or fails, the runner disables the task as its last action; unregister it afterwards (`tools/register_queue_task.ps1 -Unregister`, elevated).
+
+**Start, stop and resume.**
+- **Start:** `Start-ScheduledTask 'TORRS training queue'`, only after Task 17's gates. `status.txt` then moves through the start-up checks to `TRAINING` for `cloud_base`.
+- **Stop:** create `Malta/runs/_queue/STOP` (`New-Item Malta\runs\_queue\STOP -ItemType File`). During training the runner waits for the next `Checkpoint saved` line (at most 90 min), waits 15 s, kills python and its SUMO, runs Recovery, writes `STOPPED` and exits. During evaluation it stops at once, and the attempt does not count. Deleting STOP while the runner waits cancels the stop. The runner never deletes STOP; while it exists, a reboot only starts a runner that exits `STOPPED`.
+- **Resume:** delete STOP, then `Start-ScheduledTask 'TORRS training queue'`. Training resumes from the last good checkpoint.
+
+**Status** (all in `Malta/runs/_queue/`, gitignored):
+- `status.txt`: one line, rewritten every 60 s: `<STATE> <detail> | heartbeat <time> | runner pid <pid>`. Typical states are `TRAINING`, `EVALUATING`, `RECOVERY`, `WAITING_<reason>`, `STOPPING` and `STOPPED`. The runner ends at `QUEUE_DONE`, `FAILED`, `STUCK` or `ENV_ERROR`; `ERROR` is logged and retried after 60 s. A stale heartbeat means the runner is not running.
+- `queue.log`: one timestamped line per event.
+- `state.json`: per-run launch counters, the launch in flight, measured times and peak commit, and the per-arm thresholds set by hand after the smoke queue.
+- `quarantine_<stamp>/` and `recovery_<stamp>/`: files Recovery moved aside.
+- The live training log is `Malta/runs/<name>/logs/launch_rN.log` (evaluation: `eval_rN.log`).
+
+To read it: `Get-Content Malta\runs\_queue\status.txt`, then `Get-Content Malta\runs\_queue\queue.log -Tail 20`.
+
+**While the queue exists** (from registering the real task until it is unregistered):
+- **Code freeze:** do not edit `main.py`, `utils.py`, `run_config.py`, `run_files.py`, `agents/`, `envs/` or `Malta/build_file.py` in the main working tree. The runner hashes them at every launch, and a relaunch whose hashes differ from the run's first launch fails the run (CODE_CHANGED). That includes a fix merged while the queue is stopped, if a run is part-trained or trained but not yet evaluated. Make any fix in a git worktree and merge it only while the queue is stopped. No git stash, checkout, restore, reset or pull in the main tree.
+- Don't run `main.py`, the notebook or any other heavy job alongside it. A test or check uses TraCI port offset 20 or higher: port 0 (TraCI 27500) and `Malta/data/exp_0.*` belong to the queue.
+- No gaming, and don't open run CSVs in Excel while a run trains.
+- `python tools/rq1_manifest.py check` confirms the frozen RQ1 files are unchanged (exit 0).
+
+**Tools** (Python, run from the project root; mirrored in the notebook, sections 17–21):
+- `tools/gen_traffic.py`: pre-generates and validates the background traffic files, for example `--seeds test --factors 1.00,1.06,1.10,1.13,1.20,2.00 --check-only`. All of them exist: 110 base files (`p1.2`: training seeds 12–111 and the 10 test seeds) and the 50 sweep files (the test seeds at `p1.132`, `p1.091`, `p1.062`, `p1.0` and `p0.6`).
+- `tools/build_zones.py`: builds `Malta/data/zones_nso.csv` (each agent's nearest of the 68 councils in `Malta/data/councils_nso.csv`, and its district) and prints the per-district and per-council counts for the author's approval.
+- `tools/check_env.py --arm local|fog|cloud|hybrid --port 20`: SUMO-level checks per arm, without TensorFlow; output in `Malta/runs/_queue/check_env_<arm>.txt`. All four arms passed on 13 November (commit 1d9ff6b).
+- `tools/compare_local.py --base-worktree <dir> --port 21`: checks that the RQ1 (`local`) env gives the same states and rewards as the pre-change commit bc7115c.
+- `tools/rq1_manifest.py record|check`: the manifest of `Malta/signal_route/`, in `Malta/runs/_queue/rq1_manifest.csv` with a read-only copy in `_rq1_final_backup/`. Frozen: checkpoint-72000, the reward CSVs, `eva_data/`, `greedy_data/`, three baseline folders and `_rq1_final_backup/`. Allowed to change: `stats/`, `ablation_data*/` and `baseline_data/actuated_rerouting/`.
+
+Tests: `python -m unittest discover -s tests -t . -v` (SUMO tests use ports 20 and up), and the runner tests `powershell -NoProfile -ExecutionPolicy Bypass -File tests/test_queue_lib.ps1` and `tests/test_run_queue.ps1`. `tools/run_queue.ps1 -DryRun` prints each run's decision and the preflight without launching training; it does start the environment check, so don't use it while a job runs.
+
 ## Next steps (week 2 of the plan onwards)
 
-1. Decide whether to commit or regenerate the uncommitted fixed_static comparison (`stats/*_vs_fixed_static.csv`, from 28 October).
-2. Re-run the missing actuated_rerouting seed so all five baselines have 10 seeds, then re-run `python stats_compare.py` for MA2C against all five (RQ1). Look into why seed 40000 congests under MA2C.
-3. Re-run the routing ablation on the background network.
+1. **Launch the RQ2 queue (Task 17 of the plan).**
+   - Re-record the RQ1 manifest (`python tools/rq1_manifest.py record`, then `check`).
+   - Run the smoke queue (`config/queue_smoke.txt`) through a temporary task "TORRS smoke queue", with the fault, second-copy and STOP tests. Record the smoke numbers in `state.json`, then unregister the smoke task and move the smoke stores to the scratchpad.
+   - Author gates: a fixed pagefile on C: (initial = maximum ≥ 65,536 MB, then a reboot; Claude checks read-only for a commit limit of at least 95 GB); Windows Update paused; optionally, BIOS "restore on AC power loss"; and approval of the per-district counts from `tools/build_zones.py`. Show the author route agent rc3 (its up-edge junction is in Northern Harbour by about 70 m, while most of its corridor is in Western) and the agents near a district boundary.
+   - Register the real task (`tools/register_queue_task.ps1 -TaskName 'TORRS training queue' -QueueFile config/queue.txt`) and run `Start-ScheduledTask 'TORRS training queue'`. About 1.5 h in, at the first checkpoint, check: `rq1_manifest.py check` exits 0; only `Malta/runs/cloud_base/`, `_queue/` and the `exp_0.*` files changed; `.meta` and `.data` are each ≤ 1.5 GB; `episode_cost.csv` has a valid row.
+2. Decide whether to commit or regenerate the uncommitted fixed_static comparison (`stats/*_vs_fixed_static.csv`, from 28 October).
+3. Optional RQ1 jobs, before the queue starts or after it finishes, never during it. Re-run actuated_rerouting (`python baselines.py actuated_rerouting`, about 2.5 h). It needs all ten seeds: 10000–80000 kept no trip rows, 90000 is partial and 100000 is missing. Re-run the routing ablation on the background network (about 1.5 h). Then re-run `python stats_compare.py` for MA2C against all five baselines (RQ1). Look into why seed 40000 congests under MA2C.
 4. RQ3 compliance sweep: adapt `run_diff_com` to the Malta paths and sweep `CAV_rate`.
-5. Peak-season demand (candidate `BG_PERIOD = 0.6`, needs an NSO source), then the RQ2 architecture runs.
+5. After the queue: peak-season baselines at 1.10×, RQ2 paired statistics, and the thesis text (base demand described as a scaled, typical term-time weekday peak hour, NSO NR 182/2026 cited for the 1.10× peak factor, and the protocol changes against RQ1; spec §14).
 
 ## Working rules (from the laptop sessions)
 
 - Keep `TORRS_MA2C_Complete.ipynb` cells in sync with the `.py` files they mirror whenever those change.
 - Commit and push every change to `origin main`. Checkpoints and run logs stay gitignored.
 - Run one heavy job at a time; a second SUMO/TensorFlow job slows both.
+- While the RQ2 queue exists, keep to its code freeze and port rules (see "RQ2 training queue").
 - The dissertation must follow the approved SOI (in `claude_context/`): RQ1 learning vs rule-based and shortest-path routing; RQ2 centralised vs fog vs hybrid under base and peak season; RQ3 minimum compliance. The draft's RQ numbering still differs from the SOI.
 - Deadlines: experiments done by end of February 2027; submission May 2027.
