@@ -374,21 +374,90 @@ try {
     $r = Invoke-Recovery $proj 'never_launched' $cfg $queue -ProcessAlive $false
     if (-not ($r -eq 'SCRATCH')) { throw "a run without a store: expected SCRATCH, got $r" }
 
+    # Ruling R12a: no logged checkpoint and at most one train row is a stop before or during
+    # the first save - SCRATCH, with every checkpoint* entry quarantined and the CSVs moved.
+    $store = New-Store $proj 'arm_c'       # the save finished, its log line was not written
+    Add-Ckpt $store 144
+    Put (Join-Path $store 'train_reward.csv') (Get-TrainCsv @('144,12,-1234.5,12.1'))
+    $r = Invoke-Recovery $proj 'arm_c' $cfg $queue -ProcessAlive $false
+    if (-not ($r -eq 'SCRATCH')) { throw "complete but unlogged checkpoint + 1 row: expected SCRATCH, got $r" }
+    if (-not (@(Get-ChildItem -LiteralPath (Join-Path $store 'model')).Count -eq 0)) { throw 'SCRATCH left unlogged checkpoint files in model\' }
+    if ([IO.File]::Exists((Join-Path $store 'train_reward.csv'))) { throw 'SCRATCH left the 1-row train_reward.csv in the store' }
+    $store = New-Store $proj 'arm_c2'      # no checkpoint at all, one training row
+    Put (Join-Path $store 'train_reward.csv') (Get-TrainCsv @('144,12,-1234.5,12.1'))
+    $r = Invoke-Recovery $proj 'arm_c2' $cfg $queue -ProcessAlive $false
+    if (-not ($r -eq 'SCRATCH')) { throw "no checkpoint + 1 row: expected SCRATCH, got $r" }
+
+    $proj = New-Project; $queue = Join-Path $proj 'Malta\runs\_queue'
+    $store = New-Store $proj 'arm_b3'      # a stop during the first save: temp files only
+    Add-Ckpt $store 144 @('.data-00000-of-00001.tempstate123', '.index.tempstate456', '.meta.tmp9f8e')
+    Put (Join-Path $store 'model\checkpoint') 'model_checkpoint_path: "checkpoint-144"'
+    Put (Join-Path $store 'model\checkpoint-144_temp_ab12\part-00000-of-00001.index') 'x'
+    Put (Join-Path $store 'model\events.out.tfevents.1') 'x'
+    Put (Join-Path $store 'logs\launch_r1.log') (Get-Lines @('>>> Starting trainer.run()'))
+    Put (Join-Path $store 'train_reward.csv') (Get-TrainCsv @('144,12,-1234.5,12.1'))
+    Put (Join-Path $store 'agent_reward.csv') (Get-AgentCsv 1)
+    $r = Invoke-Recovery $proj 'arm_b3' $cfg $queue -ProcessAlive $false
+    if (-not ($r -eq 'SCRATCH')) { throw "tempstate-only first save + 1 row: expected SCRATCH, got $r" }
+    $left = @(Get-ChildItem -LiteralPath (Join-Path $store 'model') | ForEach-Object { $_.Name })
+    if (-not (($left -join '|') -eq 'events.out.tfevents.1')) { throw "SCRATCH left '$($left -join ', ')' in model\" }
+    $qd = Get-Dirs $queue 'quarantine_*'
+    $qnames = @(Get-ChildItem -LiteralPath $qd[0].FullName | ForEach-Object { $_.Name } | Sort-Object)
+    $expectQ = @('checkpoint', 'checkpoint-144.data-00000-of-00001.tempstate123', 'checkpoint-144.index.tempstate456',
+                 'checkpoint-144.meta.tmp9f8e', 'checkpoint-144_temp_ab12') | Sort-Object
+    if (-not ($qd.Count -eq 1 -and ($qnames -join '|') -eq ($expectQ -join '|'))) { throw "first-save quarantine holds '$($qnames -join ', ')'" }
+    $rd = Get-Dirs $queue 'recovery_*'
+    $rnames = @(Get-ChildItem -LiteralPath $rd[0].FullName | ForEach-Object { $_.Name } | Sort-Object)
+    if (-not ($rd.Count -eq 1 -and ($rnames -join '|') -eq 'agent_reward.csv|train_reward.csv')) { throw "first-save recovery holds '$($rnames -join ', ')'" }
+
     # -----------------------------------------------------------------------------------------
     # Invoke-Recovery: NEEDS_REVIEW (nothing is moved)
     # -----------------------------------------------------------------------------------------
     $proj = New-Project; $queue = Join-Path $proj 'Malta\runs\_queue'
-    $store = New-Store $proj 'arm_c'
+    $store = New-Store $proj 'arm_c'       # unlogged checkpoint files and two train rows
     Add-Ckpt $store 144
-    Put (Join-Path $store 'train_reward.csv') (Get-TrainCsv @('144,12,-1234.5,12.1'))
+    Add-Ckpt $store 288 @('.index', '.data-00000-of-00001.tempstate1')
+    Put (Join-Path $store 'train_reward.csv') (Get-TrainCsv @('144,12,-1234.5,12.1', '288,13,-1100.2,11.4'))
     $r = Invoke-Recovery $proj 'arm_c' $cfg $queue -ProcessAlive $false
-    if (-not ($r -like 'NEEDS_REVIEW:?*')) { throw "checkpoint files without a log line: expected NEEDS_REVIEW:<reason>, got $r" }
-    if (-not ((@(Get-ChildItem -LiteralPath (Join-Path $store 'model')).Count -eq 3))) { throw 'NEEDS_REVIEW moved checkpoint files' }
+    if (-not ($r -like 'NEEDS_REVIEW:?*')) { throw "unlogged checkpoint files + 2 rows: expected NEEDS_REVIEW:<reason>, got $r" }
+    if (-not ((@(Get-ChildItem -LiteralPath (Join-Path $store 'model')).Count -eq 5))) { throw 'NEEDS_REVIEW moved checkpoint files' }
 
-    $store = New-Store $proj 'arm_c2'      # no checkpoint at all, but a training row
-    Put (Join-Path $store 'train_reward.csv') (Get-TrainCsv @('144,12,-1234.5,12.1'))
+    $store = New-Store $proj 'arm_c2'      # no checkpoint at all, two training rows
+    Put (Join-Path $store 'train_reward.csv') (Get-TrainCsv @('144,12,-1234.5,12.1', '288,13,-1100.2,11.4'))
     $r = Invoke-Recovery $proj 'arm_c2' $cfg $queue -ProcessAlive $false
-    if (-not ($r -like 'NEEDS_REVIEW:?*')) { throw "no checkpoint but a train row: expected NEEDS_REVIEW, got $r" }
+    if (-not ($r -like 'NEEDS_REVIEW:?*')) { throw "no checkpoint but 2 train rows: expected NEEDS_REVIEW, got $r" }
+    if (-not ([IO.File]::Exists((Join-Path $store 'train_reward.csv')))) { throw 'NEEDS_REVIEW moved train_reward.csv' }
+
+    $store = New-Store $proj 'arm_c6'      # a cost row that matches no kept train step
+    Add-Ckpt $store 288
+    Put (Join-Path $store 'logs\launch_r1.log') (Get-Lines @((Get-SavedLine 'arm_c6' 288)))
+    Put (Join-Path $store 'train_reward.csv') (Get-TrainCsv @('144,12,-1234.5,12.1', '288,13,-1100.2,11.4'))
+    Put (Join-Path $store 'agent_reward.csv') (Get-AgentCsv 2)
+    Put (Join-Path $store 'episode_cost.csv') (Get-CostCsv @('1,144,12', '2,200,13'))
+    $r = Invoke-Recovery $proj 'arm_c6' $cfg $queue -ProcessAlive $false
+    if (-not ($r -like 'NEEDS_REVIEW:*episode_cost.csv*')) { throw "a cost row matching no train step: expected NEEDS_REVIEW, got $r" }
+
+    $store = New-Store $proj 'arm_c7'      # a torn cost row that is NOT the last row
+    Add-Ckpt $store 288
+    Put (Join-Path $store 'logs\launch_r1.log') (Get-Lines @((Get-SavedLine 'arm_c7' 288)))
+    Put (Join-Path $store 'train_reward.csv') (Get-TrainCsv @('144,12,-1234.5,12.1', '288,13,-1100.2,11.4'))
+    Put (Join-Path $store 'agent_reward.csv') (Get-AgentCsv 2)
+    Put (Join-Path $store 'episode_cost.csv') ($CostHeader + "`r`n1,144,12,100.0`r`n" + (Get-CostCsv @('2,288,13')).Substring($CostHeader.Length + 2))
+    $r = Invoke-Recovery $proj 'arm_c7' $cfg $queue -ProcessAlive $false
+    if (-not ($r -like 'NEEDS_REVIEW:*episode_cost.csv*')) { throw "a torn cost row before the last: expected NEEDS_REVIEW, got $r" }
+
+    $store = New-Store $proj 'arm_c8'      # a restore error whose checkpoint step is unknown
+    Add-Ckpt $store 144
+    Add-Ckpt $store 288
+    Put (Join-Path $store 'logs\launch_r1.log') (Get-Lines @((Get-SavedLine 'arm_c8' 144), (Get-SavedLine 'arm_c8' 288)))
+    Put (Join-Path $store 'logs\launch_r2.log') (Get-Lines @('Traceback (most recent call last):',
+        'tensorflow.python.framework.errors_impl.DataLossError: Checksum does not match: stored 1 vs. calculated on the restored bytes 2'))
+    Put (Join-Path $store 'train_reward.csv') (Get-TrainCsv @('144,12,-1234.5,12.1', '288,13,-1100.2,11.4'))
+    Put (Join-Path $store 'agent_reward.csv') (Get-AgentCsv 2)
+    Put (Join-Path $store 'episode_cost.csv') (Get-CostCsv @('1,144,12', '2,288,13'))
+    $r = Invoke-Recovery $proj 'arm_c8' $cfg $queue -ProcessAlive $false
+    if (-not ($r -like 'NEEDS_REVIEW:*cannot be determined*')) { throw "a restore error with no step: expected NEEDS_REVIEW, got $r" }
+    if (-not ((Test-Path -LiteralPath (Join-Path $store 'model\checkpoint-288.index')) -and (Test-Path -LiteralPath (Join-Path $store 'model\checkpoint-144.index')))) { throw 'a restore error with no step quarantined a checkpoint' }
 
     $store = New-Store $proj 'arm_c3'      # reward CSV SHORT: checkpoint-288 logged, one train row
     Add-Ckpt $store 288
@@ -418,6 +487,54 @@ try {
     if (-not ((Get-Dirs $queue 'quarantine_*').Count -eq 0 -and (Get-Dirs $queue 'recovery_*').Count -eq 0)) { throw 'NEEDS_REVIEW cases moved files' }
 
     # -----------------------------------------------------------------------------------------
+    # Invoke-Recovery: missing cost rows are padded with lost = 1 rows (ruling R12b)
+    # -----------------------------------------------------------------------------------------
+    $proj = New-Project; $queue = Join-Path $proj 'Malta\runs\_queue'
+    $lost288 = '2,288,13,NaN,NaN,NaN,NaN,NaN,NaN,NaN,NaN,1'
+    $store = New-Store $proj 'arm_k'       # two rows short
+    Add-Ckpt $store 432
+    Put (Join-Path $store 'logs\launch_r1.log') (Get-Lines @((Get-SavedLine 'arm_k' 432)))
+    Put (Join-Path $store 'train_reward.csv') (Get-TrainCsv @('144,12,-1234.5,12.1', '288,13,-1100.2,11.4', '432,14,-1000.0,10.9'))
+    Put (Join-Path $store 'agent_reward.csv') (Get-AgentCsv 3)
+    Put (Join-Path $store 'episode_cost.csv') (Get-CostCsv @('1,144,12'))
+    $r = Invoke-Recovery $proj 'arm_k' $cfg $queue -ProcessAlive $false
+    $cl = Get-DataLines (Join-Path $store 'episode_cost.csv')
+    if (-not ($r -eq 'RESUME' -and $cl.Count -eq 4 -and $cl[1] -like '1,144,12,100.0000,*,0' -and $cl[2] -eq $lost288 -and
+              $cl[3] -eq '3,432,14,NaN,NaN,NaN,NaN,NaN,NaN,NaN,NaN,1')) { throw "cost CSV two rows short: $r / $($cl -join ' / ')" }
+
+    $store = New-Store $proj 'arm_k2'      # cost file absent, two train rows
+    Add-Ckpt $store 288
+    Put (Join-Path $store 'logs\launch_r1.log') (Get-Lines @((Get-SavedLine 'arm_k2' 288)))
+    Put (Join-Path $store 'train_reward.csv') (Get-TrainCsv @('144,12,-1234.5,12.1', '288,13,-1100.2,11.4'))
+    Put (Join-Path $store 'agent_reward.csv') (Get-AgentCsv 2)
+    $r = Invoke-Recovery $proj 'arm_k2' $cfg $queue -ProcessAlive $false
+    $cp = Join-Path $store 'episode_cost.csv'
+    $cl = Get-DataLines $cp
+    if (-not ($r -eq 'RESUME' -and $cl.Count -eq 3 -and $cl[0] -eq $CostHeader -and $cl[1] -eq '1,144,12,NaN,NaN,NaN,NaN,NaN,NaN,NaN,NaN,1' -and
+              $cl[2] -eq $lost288)) { throw "absent cost CSV: $r / $($cl -join ' / ')" }
+    if (-not (Test-NoBom $cp)) { throw 'the new episode_cost.csv has a BOM' }
+
+    $store = New-Store $proj 'arm_k3'      # a torn last cost row (too few fields)
+    Add-Ckpt $store 288
+    Put (Join-Path $store 'logs\launch_r1.log') (Get-Lines @((Get-SavedLine 'arm_k3' 288)))
+    Put (Join-Path $store 'train_reward.csv') (Get-TrainCsv @('144,12,-1234.5,12.1', '288,13,-1100.2,11.4'))
+    Put (Join-Path $store 'agent_reward.csv') (Get-AgentCsv 2)
+    Put (Join-Path $store 'episode_cost.csv') ((Get-CostCsv @('1,144,12')) + '2,288,13,100.0')
+    $r = Invoke-Recovery $proj 'arm_k3' $cfg $queue -ProcessAlive $false
+    $cl = Get-DataLines (Join-Path $store 'episode_cost.csv')
+    if (-not ($r -eq 'RESUME' -and $cl.Count -eq 3 -and $cl[1] -like '1,144,12,*,0' -and $cl[2] -eq $lost288)) { throw "torn last cost row: $r / $($cl -join ' / ')" }
+
+    $store = New-Store $proj 'arm_k4'      # a torn last cost row whose step does not parse
+    Add-Ckpt $store 288
+    Put (Join-Path $store 'logs\launch_r1.log') (Get-Lines @((Get-SavedLine 'arm_k4' 288)))
+    Put (Join-Path $store 'train_reward.csv') (Get-TrainCsv @('144,12,-1234.5,12.1', '288,13,-1100.2,11.4'))
+    Put (Join-Path $store 'agent_reward.csv') (Get-AgentCsv 2)
+    Put (Join-Path $store 'episode_cost.csv') (Get-CostCsv @('1,144,12', '2,2x8,13'))
+    $r = Invoke-Recovery $proj 'arm_k4' $cfg $queue -ProcessAlive $false
+    $cl = Get-DataLines (Join-Path $store 'episode_cost.csv')
+    if (-not ($r -eq 'RESUME' -and $cl.Count -eq 3 -and $cl[2] -eq $lost288)) { throw "unparseable last cost step: $r / $($cl -join ' / ')" }
+
+    # -----------------------------------------------------------------------------------------
     # Invoke-Recovery: a restore error quarantines that checkpoint and falls back one
     # -----------------------------------------------------------------------------------------
     $proj = New-Project; $queue = Join-Path $proj 'Malta\runs\_queue'
@@ -441,6 +558,47 @@ try {
     if (-not ((Get-DataLines (Join-Path $store 'train_reward.csv')).Count -eq 2)) { throw 'restore fallback did not trim train_reward.csv to 1 row' }
     $cl = Get-DataLines (Join-Path $store 'episode_cost.csv')
     if (-not ($cl.Count -eq 2 -and $cl[1] -like '1,144,12,*,0')) { throw "restore fallback cost CSV: $($cl -join ' / ')" }
+    $qd = Get-Dirs $queue 'quarantine_*'
+    $note = Join-Path $qd[0].FullName 'restore_errors.txt'
+    if (-not ([IO.File]::Exists($note) -and ([IO.File]::ReadAllText($note)).StartsWith('run=arm_d log=launch_r2.log step=288'))) { throw 'the handled restore error was not noted in restore_errors.txt' }
+    # A repeated recovery after the restore-error quarantine moves nothing more.
+    $queueFiles = @(Get-ChildItem -LiteralPath $queue -Recurse -Force).Count
+    $r = Invoke-Recovery $proj 'arm_d' $cfg $queue -ProcessAlive $false
+    if (-not ($r -eq 'RESUME')) { throw "repeated recovery after a restore error: expected RESUME, got $r" }
+    if (-not (@(Get-ChildItem -LiteralPath $queue -Recurse -Force).Count -eq $queueFiles)) { throw 'a repeated recovery after a restore error moved more files' }
+    if (-not ((Get-GoodCheckpoint $proj 'arm_d') -eq 144)) { throw 'a repeated recovery quarantined checkpoint-144' }
+    # Still once only when the checkpoint is put back (the author restores checkpoint-288 and the CSVs).
+    $rd = Get-Dirs $queue 'recovery_*'
+    Copy-Item -Path (Join-Path $qd[0].FullName 'checkpoint-288.*') -Destination (Join-Path $store 'model')
+    Copy-Item -Path (Join-Path $rd[0].FullName '*.csv') -Destination $store
+    $r = Invoke-Recovery $proj 'arm_d' $cfg $queue -ProcessAlive $false
+    if (-not ($r -eq 'RESUME' -and (Get-GoodCheckpoint $proj 'arm_d') -eq 288)) { throw "the same launch log's restore error was handled twice: $r" }
+    if (-not ((Get-Dirs $queue 'quarantine_*').Count -eq 1)) { throw 'a handled restore error made a second quarantine folder' }
+
+    # A restore error followed, in the same newest log, by a saved checkpoint is ignored.
+    $store = New-Store $proj 'arm_d4'
+    Add-Ckpt $store 144
+    Add-Ckpt $store 288
+    Put (Join-Path $store 'logs\launch_r1.log') (Get-Lines @((Get-SavedLine 'arm_d4' 144)))
+    Put (Join-Path $store 'logs\launch_r2.log') (Get-Lines @('Restoring parameters from Malta/runs/arm_d4/model/checkpoint-144',
+        'DataLossError: Unable to open table file Malta/runs/arm_d4/model/checkpoint-144.index', (Get-SavedLine 'arm_d4' 288)))
+    Put (Join-Path $store 'train_reward.csv') (Get-TrainCsv @('144,12,-1234.5,12.1', '288,13,-1100.2,11.4'))
+    Put (Join-Path $store 'agent_reward.csv') (Get-AgentCsv 2)
+    Put (Join-Path $store 'episode_cost.csv') (Get-CostCsv @('1,144,12', '2,288,13'))
+    $r = Invoke-Recovery $proj 'arm_d4' $cfg $queue -ProcessAlive $false
+    if (-not ($r -eq 'RESUME' -and [IO.File]::Exists((Join-Path $store 'model\checkpoint-144.index')))) { throw "a restore error followed by a save was acted on: $r" }
+
+    # 'corrupted' alone is not one of the spec's restore errors.
+    $store = New-Store $proj 'arm_d5'
+    Add-Ckpt $store 144
+    Add-Ckpt $store 288
+    Put (Join-Path $store 'logs\launch_r1.log') (Get-Lines @((Get-SavedLine 'arm_d5' 144), (Get-SavedLine 'arm_d5' 288)))
+    Put (Join-Path $store 'logs\launch_r2.log') (Get-Lines @('Restoring parameters from Malta/runs/arm_d5/model/checkpoint-288', 'tensorflow error: corrupted record at 12'))
+    Put (Join-Path $store 'train_reward.csv') (Get-TrainCsv @('144,12,-1234.5,12.1', '288,13,-1100.2,11.4'))
+    Put (Join-Path $store 'agent_reward.csv') (Get-AgentCsv 2)
+    Put (Join-Path $store 'episode_cost.csv') (Get-CostCsv @('1,144,12', '2,288,13'))
+    $r = Invoke-Recovery $proj 'arm_d5' $cfg $queue -ProcessAlive $false
+    if (-not ($r -eq 'RESUME' -and (Get-GoodCheckpoint $proj 'arm_d5') -eq 288)) { throw "'corrupted' was treated as a restore error: $r" }
 
     # The same error in an OLDER launch log (the newest launch saved checkpoints) is ignored.
     $store = New-Store $proj 'arm_d2'
@@ -642,6 +800,17 @@ try {
     $c = New-EvalCase @((Get-Block '1.10' 'p1.091' '10738' '10738')) -Complete '>>> EVALUATE COMPLETE levels=1' -Trips @{ '1.00' = 5; '1.10' = 4 }
     $e = Invoke-Eval $c @(1.10)
     if ($e.Ok -or -not (($e.FailedLevels -join ',') -eq '1.10')) { throw "retry of f1.10 with fewer trips than the earlier f1.00: got '$($e.FailedLevels -join ',')'" }
+
+    # The trips check fails a fall up to f1.20; above it (f2.00, which may gridlock) it warns.
+    $c = New-EvalCase @((Get-Block '1.13' 'p1.062' '11030' '11030'), (Get-Block '1.20' 'p1.0' '11714' '11714')) -Trips @{ '1.13' = 5; '1.20' = 4 }
+    $e = Invoke-Eval $c @(1.13, 1.20)
+    if ($e.Ok -or -not (($e.FailedLevels -join ',') -eq '1.20')) { throw "fewer trips at f1.20 than f1.13: got '$($e.FailedLevels -join ',')'" }
+    $c = New-EvalCase @((Get-Block '1.20' 'p1.0' '11714' '11714'), (Get-Block '2.00' 'p0.6' '19524' '19524')) -Trips @{ '1.20' = 4; '2.00' = 3 }
+    $e = Invoke-Eval $c @(1.20, 2.00)
+    if (-not $e.Ok) { throw "fewer trips at the f2.00 stress level should not fail: $($e.Reason)" }
+    if (-not (@($e.Warnings).Count -eq 1 -and $e.Warnings[0] -like '*f1.20*f2.00*')) { throw "f2.00 trips fall should be a warning, got '$($e.Warnings -join ' / ')'" }
+    $c = New-EvalCase $good2
+    if (-not (@((Invoke-Eval $c).Warnings).Count -eq 0)) { throw 'a good attempt should have no warnings' }
 
     # -----------------------------------------------------------------------------------------
     # state.json and the launch counters

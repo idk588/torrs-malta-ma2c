@@ -7,8 +7,9 @@ Windows PowerShell 5.1. Dot-source it:  . (Join-Path $PSScriptRoot 'queue_lib.ps
 
 These functions decide; they do not launch processes and never delete a file. The only side
 effects are the writes a caller asks for (Write-Utf8NoBom, Add-Utf8NoBomLine, Save-QueueState)
-and Invoke-Recovery, which only moves files into the queue folder and rewrites the three run
-CSVs after copying the originals there.
+and Invoke-Recovery, which only moves files into the queue folder, rewrites the three run CSVs
+after copying the originals there, and notes each handled restore error in
+quarantine_<stamp>\restore_errors.txt so it is handled once.
 
 Paths
   Functions take the absolute project root and the run name. Files are reached through absolute
@@ -34,7 +35,7 @@ Functions
   Get-RunStage $ProjectRoot $RunName $Cfg [-ProcessAlive] -> 'DONE' | 'FAILED' | 'EVALUATE' | 'TRAIN'
   Invoke-Recovery $ProjectRoot $RunName $Cfg $QueueDir [-ProcessAlive] [-Log {param($m)}]
                                               -> 'RESUME' | 'SCRATCH' | 'NEEDS_REVIEW:<reason>'
-  Test-EvalAttempt $ProjectRoot $RunName $Cfg $LogPath $LaunchTime [-Levels] -> { Ok; FailedLevels; Reason }
+  Test-EvalAttempt $ProjectRoot $RunName $Cfg $LogPath $LaunchTime [-Levels] -> { Ok; FailedLevels; Reason; Warnings }
   Read-QueueState $QueueDir -> state          Save-QueueState $QueueDir $State
   Get-RunCounters $State $Run -> the run's entry (created with defaults if missing)
   Update-LaunchCounters $State $Run $GoodBefore $GoodAfter $Interrupted -> 'OK' | 'STUCK'
@@ -84,7 +85,8 @@ $QueueMaxNoProgress = 3
 $QueueMaxLaunches = 12
 $QueueTrainPort = 27500                          # TraCI port 0, reserved for the queue
 $QueueCostHeader = 'episode,step,seed,wall_s,rollout_s,update_s,save_s,peak_private_gb,peak_working_set_gb,ckpt_data_mb,ckpt_meta_mb,lost'
-$QueueRestoreErrorPattern = '(?i)DataLossError|Unable to open table file|corrupted'
+$QueueRestoreErrorPattern = 'DataLossError|Unable to open table file'   # spec 9; matched case-sensitively
+$QueueTripsCheckMaxLevel = 1.20                  # mean trips must not fall up to this level (spec 8)
 $QueueUtf8NoBom = New-Object System.Text.UTF8Encoding $false
 $QueueInvariant = [System.Globalization.CultureInfo]::InvariantCulture
 $QueueFloatStyle = [System.Globalization.NumberStyles]::Float
@@ -264,12 +266,13 @@ function ConvertFrom-CsvLine([string]$Line) {
     return , $arr
 }
 
-function Read-CsvFile([string]$Path, [switch]$NoHeader) {
+function Read-CsvFile([string]$Path, [switch]$NoHeader, [switch]$AllowTornLastRow) {
     # Rows keep their original text (Line, with its line end) for trimming, and their Fields.
     # Blank lines are skipped. Ok is false when a row's field count differs from the header's
-    # (or, with -NoHeader, from the first row's).
+    # (or, with -NoHeader, from the first row's). With -AllowTornLastRow such a row is dropped
+    # instead when it is the last non-blank line (TornLast = its text).
     $res = [pscustomobject]@{
-        Exists = $false; Ok = $true; Error = $null; Text = $null; NewLine = "`r`n"
+        Exists = $false; Ok = $true; Error = $null; Text = $null; NewLine = "`r`n"; TornLast = $null
         HeaderLine = $null; Header = $null; Rows = (New-Object System.Collections.Generic.List[object])
     }
     if (-not [IO.File]::Exists($Path)) { return $res }
@@ -277,14 +280,11 @@ function Read-CsvFile([string]$Path, [switch]$NoHeader) {
     $text = Read-SharedText $Path
     $res.Text = $text
     if ($text.IndexOf("`r`n") -lt 0 -and $text.IndexOf("`n") -ge 0) { $res.NewLine = "`n" }
+    $parts = @([regex]::Split($text, '(?<=\n)') | Where-Object { $_.Trim().Length -gt 0 })
     $width = -1
-    $lineNo = 0
-    foreach ($part in [regex]::Split($text, '(?<=\n)')) {
-        if ($part.Length -eq 0) { continue }
-        $lineNo++
-        $body = $part.TrimEnd([char[]]"`r`n")
-        if ($body.Trim().Length -eq 0) { continue }
-        $fields = ConvertFrom-CsvLine $body
+    for ($p = 0; $p -lt $parts.Count; $p++) {
+        $part = $parts[$p]
+        $fields = ConvertFrom-CsvLine ($part.TrimEnd([char[]]"`r`n"))
         if (-not $NoHeader -and $null -eq $res.HeaderLine) {
             $res.HeaderLine = $part
             $res.Header = $fields
@@ -293,8 +293,9 @@ function Read-CsvFile([string]$Path, [switch]$NoHeader) {
         }
         if ($width -lt 0) { $width = $fields.Length }
         if ($fields.Length -ne $width) {
+            if ($AllowTornLastRow -and $p -eq $parts.Count - 1) { $res.TornLast = $part.TrimEnd([char[]]"`r`n"); break }
             $res.Ok = $false
-            $res.Error = "line $lineNo has $($fields.Length) fields, expected $width"
+            $res.Error = "row $($res.Rows.Count + 1) has $($fields.Length) fields, expected $width"
             return $res
         }
         $line = $part
@@ -537,10 +538,13 @@ function Get-GoodCheckpoint {
     return -1
 }
 
-function Get-CheckpointEntries([string]$ModelDir) {
-    # Files and folders named checkpoint-* (not the TF state file 'checkpoint').
+function Get-CheckpointEntries([string]$ModelDir, [switch]$WithState) {
+    # Files and folders named checkpoint-*; with -WithState also the TF state file 'checkpoint'
+    # and its temp files (every name main.py's loader looks at).
     if (-not [IO.Directory]::Exists($ModelDir)) { return }
-    Get-ChildItem -LiteralPath $ModelDir -Force -ErrorAction Stop | Where-Object { $_.Name -like 'checkpoint-*' }
+    $pattern = 'checkpoint-*'
+    if ($WithState) { $pattern = 'checkpoint*' }
+    Get-ChildItem -LiteralPath $ModelDir -Force -ErrorAction Stop | Where-Object { $_.Name -like $pattern }
 }
 
 function Test-UnsafeCheckpointName([string]$Name, [long]$GoodStep) {
@@ -552,29 +556,60 @@ function Test-UnsafeCheckpointName([string]$Name, [long]$GoodStep) {
 }
 
 function Get-RestoreError([string]$ProjectRoot, [string]$RunName) {
-    # A checkpoint restore error in the newest launch log -> { Log; Step } (Step -1 = unknown),
-    # or $null. Only a launch that saved nothing counts: a restore error stops main.py before
-    # its first save, and older logs are ignored so a re-saved checkpoint is never blamed.
+    # A checkpoint restore error in the newest launch log -> { Log; LogName; Step } (Step -1 =
+    # the failing checkpoint cannot be determined), or $null.
+    # - Only the newest launch is read: the error is handled right after the launch that hit it,
+    #   and an older log is never re-read, so a checkpoint saved again later is never blamed.
+    # - The error lines are those with 'DataLossError' or 'Unable to open table file' (spec 9).
+    # - It counts only when no 'Checkpoint saved' line of the run follows the first error line:
+    #   a restore error stops main.py before its first save.
+    # - The step comes from the error line ('<store>model/checkpoint-N', else 'checkpoint-N'),
+    #   else from the last 'Restoring parameters from <store>model/checkpoint-N' before it.
     $launches = @(Get-LaunchFiles $ProjectRoot $RunName 'launch')
     if ($launches.Count -eq 0) { return $null }
     $log = $launches[-1].Log
     if (-not [IO.File]::Exists($log)) { return $null }
-    $text = Read-SharedText $log
+    $lines = (Read-SharedText $log) -split "`r?`n"
     $relModel = (Get-StoreRel $RunName) + 'model/'
-    if ([regex]::IsMatch($text, '(?m)(?:^|\s)Checkpoint saved at step \d+ -> ' + [regex]::Escape($relModel) + '\r?$')) { return $null }
-    $errors = @(($text -split "`r?`n") | Where-Object { $_ -match $QueueRestoreErrorPattern })
-    if ($errors.Count -eq 0) { return $null }
+    $savedRe = '(?:^|\s)Checkpoint saved at step \d+ -> ' + [regex]::Escape($relModel) + '\s*$'
+    $first = -1
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        if ($lines[$i] -cmatch $QueueRestoreErrorPattern) { $first = $i; break }
+    }
+    if ($first -lt 0) { return $null }
+    for ($i = $first + 1; $i -lt $lines.Count; $i++) {
+        if ($lines[$i] -match $savedRe) { return $null }
+    }
     $step = -1
-    foreach ($e in $errors) {
-        $m = [regex]::Match($e, [regex]::Escape($relModel + 'checkpoint-') + '(\d{1,9})')
-        if (-not $m.Success) { $m = [regex]::Match($e, '(?:^|[\s\\/])checkpoint-(\d{1,9})') }
-        if ($m.Success) { $step = [int]$m.Groups[1].Value; break }
+    for ($i = $first; $i -lt $lines.Count -and $step -lt 0; $i++) {
+        if ($lines[$i] -cnotmatch $QueueRestoreErrorPattern) { continue }
+        $m = [regex]::Match($lines[$i], [regex]::Escape($relModel + 'checkpoint-') + '(\d{1,9})')
+        if (-not $m.Success) { $m = [regex]::Match($lines[$i], '(?:^|[\s\\/])checkpoint-(\d{1,9})') }
+        if ($m.Success) { $step = [int]$m.Groups[1].Value }
     }
     if ($step -lt 0) {
-        $ms = [regex]::Matches($text, 'Restoring parameters from ' + [regex]::Escape($relModel + 'checkpoint-') + '(\d{1,9})')
-        if ($ms.Count -gt 0) { $step = [int]$ms[$ms.Count - 1].Groups[1].Value }
+        $restoreRe = 'Restoring parameters from ' + [regex]::Escape($relModel + 'checkpoint-') + '(\d{1,9})\s*$'
+        for ($i = $first; $i -ge 0 -and $step -lt 0; $i--) {
+            $m = [regex]::Match($lines[$i], $restoreRe)
+            if ($m.Success) { $step = [int]$m.Groups[1].Value }
+        }
     }
-    [pscustomobject]@{ Log = $log; Step = $step }
+    [pscustomobject]@{ Log = $log; LogName = [IO.Path]::GetFileName($log); Step = $step }
+}
+
+function Test-RestoreErrorHandled([string]$QueueDir, [string]$RunName, [string]$LogName) {
+    # Whether a recovery already quarantined the checkpoint behind this launch log's restore
+    # error: a line 'run=<name> log=<launch_rN.log> step=<N>' in a quarantine_*\restore_errors.txt.
+    if (-not [IO.Directory]::Exists($QueueDir)) { return $false }
+    $key = 'run=' + $RunName + ' log=' + $LogName + ' '
+    foreach ($d in [IO.Directory]::GetDirectories($QueueDir, 'quarantine_*')) {
+        $f = Join-Path $d 'restore_errors.txt'
+        if (-not [IO.File]::Exists($f)) { continue }
+        foreach ($l in ((Read-SharedText $f) -split "`r?`n")) {
+            if ($l.StartsWith($key, [StringComparison]::OrdinalIgnoreCase)) { return $true }
+        }
+    }
+    $false
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -767,49 +802,55 @@ function Get-CsvRepairPlan([string]$Store, [int]$Good, $Cfg) {
     for ($i = 0; $i -lt $n; $i++) { [void]$sb.Append($ag.Rows[$i].Line) }
     $agentNew = $sb.ToString()
 
-    # episode_cost.csv: rows with step <= good matching the kept train steps; exactly one
-    # missing row is replaced by a NaN row with lost = 1 (episode, step and seed from train).
+    # episode_cost.csv (ruling R12b): for each kept train step its cost row, or, when that row
+    # is missing, a row '<step/T>,<step>,<seed>,NaN x8,1' (episode, step and seed from the train
+    # row; lost = 1). The file may be absent. Cost rows above the good step are dropped, and so
+    # is a torn last row (wrong field count, or a step that does not parse). NEEDS_REVIEW only
+    # when a kept cost row matches no train step (or two cost rows share a step).
     $costPath = Join-Path $Store 'episode_cost.csv'
-    $co = Read-CsvFile $costPath
+    $co = Read-CsvFile $costPath -AllowTornLastRow
     if (-not $co.Ok) { return (& $fail "episode_cost.csv does not parse ($($co.Error))") }
     $nl = $co.NewLine
     $costHead = $QueueCostHeader + $nl
-    $costSteps = @()
+    $byStep = @{}
+    $dropped = New-Object System.Collections.Generic.List[string]
+    if ($null -ne $co.TornLast) { $dropped.Add("torn last row '$($co.TornLast)'") }
     if ($null -ne $co.HeaderLine) {
         if ($co.HeaderLine.Trim() -ne $QueueCostHeader) { return (& $fail 'episode_cost.csv does not start with the cost header') }
         $costHead = $co.HeaderLine
         if (-not $costHead.EndsWith("`n")) { $costHead += $nl }
-        $cs = Get-ColumnWholeNumbers $co 'step' -Increasing
-        if ($null -ne $cs.Error) { return (& $fail "episode_cost.csv does not parse ($($cs.Error))") }
-        $costSteps = $cs.Values
+        $ci = Get-HeaderIndex $co 'step'
+        for ($i = 0; $i -lt $co.Rows.Count; $i++) {
+            $raw = $co.Rows[$i].Fields[$ci]
+            $cstep = ConvertTo-WholeNumber $raw
+            if ($null -eq $cstep) {
+                if ($i -eq $co.Rows.Count - 1) { $dropped.Add("torn last row with step '$raw'"); continue }
+                return (& $fail "episode_cost.csv does not parse (row $($i + 1) has step '$raw')")
+            }
+            if ($cstep -gt $Good) { continue }
+            if ($byStep.ContainsKey($cstep)) { return (& $fail "episode_cost.csv has two rows for step $cstep") }
+            $byStep[$cstep] = $co.Rows[$i].Line
+        }
     }
-    $ck = 0
-    while ($ck -lt $costSteps.Count -and $costSteps[$ck] -le $Good) { $ck++ }
+    $trainSteps = @{}
+    for ($i = 0; $i -lt $n; $i++) { $trainSteps[$steps.Values[$i]] = $true }
+    foreach ($s in $byStep.Keys) {
+        if (-not $trainSteps.ContainsKey($s)) { return (& $fail "episode_cost.csv has a row for step $s, which no kept train_reward.csv row has") }
+    }
     $seedIdx = Get-HeaderIndex $tr 'seed'
     $rows = New-Object System.Collections.Generic.List[string]
-    $lost = $null
-    if ($ck -eq $n) {
-        for ($i = 0; $i -lt $n; $i++) {
-            if ($costSteps[$i] -ne $steps.Values[$i]) { return (& $fail "episode_cost.csv row $($i + 1) has step $($costSteps[$i]), train_reward.csv has $($steps.Values[$i])") }
-            $rows.Add($co.Rows[$i].Line)
+    $lostRows = New-Object System.Collections.Generic.List[string]
+    for ($i = 0; $i -lt $n; $i++) {
+        $step = $steps.Values[$i]
+        if ($byStep.ContainsKey($step)) { $rows.Add($byStep[$step]); continue }
+        $seedText = 'NaN'
+        if ($seedIdx -ge 0) {
+            $sv = ConvertTo-WholeNumber $tr.Rows[$i].Fields[$seedIdx]
+            if ($null -ne $sv) { $seedText = [string]::Format($QueueInvariant, '{0}', $sv) }
         }
-    } elseif ($ck -eq $n - 1) {
-        $j = 0
-        for ($i = 0; $i -lt $n; $i++) {
-            $step = $steps.Values[$i]
-            if ($j -lt $ck -and $costSteps[$j] -eq $step) { $rows.Add($co.Rows[$j].Line); $j++; continue }
-            if ($null -ne $lost) { return (& $fail "episode_cost.csv steps do not match train_reward.csv (step $step)") }
-            $seedText = 'NaN'
-            if ($seedIdx -ge 0) {
-                $sv = ConvertTo-WholeNumber $tr.Rows[$i].Fields[$seedIdx]
-                if ($null -ne $sv) { $seedText = [string]::Format($QueueInvariant, '{0}', $sv) }
-            }
-            $lost = [string]::Format($QueueInvariant, '{0},{1},{2},NaN,NaN,NaN,NaN,NaN,NaN,NaN,NaN,1', [long]($step / $T), $step, $seedText)
-            $rows.Add($lost + $nl)
-        }
-        if ($j -ne $ck) { return (& $fail 'episode_cost.csv steps do not match train_reward.csv') }
-    } else {
-        return (& $fail "episode_cost.csv has $ck row(s) up to step $Good for $n training episode(s)")
+        $lost = [string]::Format($QueueInvariant, '{0},{1},{2},NaN,NaN,NaN,NaN,NaN,NaN,NaN,NaN,1', [long]($step / $T), $step, $seedText)
+        $lostRows.Add($lost)
+        $rows.Add($lost + $nl)
     }
     $costNew = $costHead + ($rows -join '')
 
@@ -822,7 +863,8 @@ function Get-CsvRepairPlan([string]$Store, [int]$Good, $Cfg) {
     if ($tr.Rows.Count -ne $n) { $notes.Add("train_reward.csv $($tr.Rows.Count) -> $n rows") }
     if ($ag.Rows.Count -ne $n) { $notes.Add("agent_reward.csv $($ag.Rows.Count) -> $n rows") }
     if ($co.Rows.Count -ne $n) { $notes.Add("episode_cost.csv $($co.Rows.Count) -> $n rows") }
-    if ($null -ne $lost) { $notes.Add("lost cost row added: $lost") }
+    if ($dropped.Count -gt 0) { $notes.Add('episode_cost.csv dropped ' + ($dropped -join ', ')) }
+    if ($lostRows.Count -gt 0) { $notes.Add("$($lostRows.Count) lost cost row(s) added: " + ($lostRows -join ' | ')) }
     [pscustomobject]@{ Error = $null; Files = $files; Notes = ($notes -join ', ') }
 }
 
@@ -837,12 +879,19 @@ function Invoke-Recovery {
     )
     $ErrorActionPreference = 'Stop'
     # Spec 9 Recovery: make model\ and the run CSVs consistent with the good checkpoint. Only
-    # moves files - into <QueueDir>\quarantine_<stamp>\ (checkpoint files) and
-    # <QueueDir>\recovery_<stamp>\ (CSV originals, partial CSVs before a scratch start).
+    # moves files - into <QueueDir>\quarantine_<stamp>\ (checkpoint files, plus a
+    # restore_errors.txt note) and <QueueDir>\recovery_<stamp>\ (CSV originals; the CSVs of a
+    # scratch start).
     #   RESUME         the good checkpoint and the CSVs agree; main.py resumes from it.
-    #   SCRATCH        model\ has no checkpoint-* and train_reward.csv is absent or has no rows.
+    #   SCRATCH        no logged checkpoint and train_reward.csv absent or with at most 1 row
+    #                  (ruling R12a: a stop before or during the first save). Every checkpoint*
+    #                  entry of model\ (temp files, _temp folders and the TF state file too) is
+    #                  quarantined and the three CSVs are moved to recovery_<stamp>.
     #   NEEDS_REVIEW:  the run must be marked FAILED for the author. Nothing was moved, except a
-    #                  checkpoint that failed to restore in the newest launch.
+    #                  checkpoint that failed to restore in the newest launch. Cases: no logged
+    #                  checkpoint and more than 1 train row; train_reward.csv unparseable; a
+    #                  restore error whose checkpoint step cannot be determined; CSVs that do not
+    #                  match the good checkpoint (Get-CsvRepairPlan).
     Assert-AbsolutePath $ProjectRoot 'ProjectRoot'
     Assert-AbsolutePath $QueueDir 'QueueDir'
     if ($null -eq $ProcessAlive) { $ProcessAlive = Test-RunProcessAlive $RunName }
@@ -855,35 +904,48 @@ function Invoke-Recovery {
     $say = { param([string]$m) if ($null -ne $Log) { $null = & $Log ('recovery ' + $RunName + ': ' + $m) } }
 
     # 1. A checkpoint that failed to restore in the newest launch is quarantined, so the good
-    #    checkpoint falls back to the next older one.
+    #    checkpoint falls back to the next older one. An unknown step is left for review rather
+    #    than blaming the good checkpoint. Each launch log's error is handled once: the move is
+    #    noted in quarantine_<stamp>\restore_errors.txt and a later recovery skips that log.
     $restore = Get-RestoreError $ProjectRoot $RunName
-    if ($null -ne $restore) {
+    if ($null -ne $restore -and -not (Test-RestoreErrorHandled $QueueDir $RunName $restore.LogName)) {
+        if ($restore.Step -lt 0) {
+            return "NEEDS_REVIEW:restore error in $($restore.LogName), but the failing checkpoint step cannot be determined"
+        }
         $bad = $restore.Step
-        if ($bad -lt 0) { $bad = Get-GoodCheckpoint $ProjectRoot $RunName }
-        if ($bad -ge 0) {
-            $prefix = 'checkpoint-' + $bad + '.'
-            $hits = @(Get-CheckpointEntries $modelDir | Where-Object { $_.Name.StartsWith($prefix) })
+        $prefix = 'checkpoint-' + $bad + '.'
+        $hits = @(Get-CheckpointEntries $modelDir | Where-Object { $_.Name.StartsWith($prefix) })
+        if ($hits.Count -gt 0) {
             foreach ($e in $hits) { Move-ToFolder $e.FullName $quarantine }
-            if ($hits.Count -gt 0) {
-                & $say ("restore error in {0}: moved checkpoint-{1} ({2} file(s)) to {3}" -f [IO.Path]::GetFileName($restore.Log), $bad, $hits.Count, $quarantine)
-            }
+            Add-Utf8NoBomLine (Join-Path $quarantine 'restore_errors.txt') ('run={0} log={1} step={2}' -f $RunName, $restore.LogName, $bad)
+            & $say ('restore error in {0}: moved checkpoint-{1} ({2} file(s)) to {3}' -f $restore.LogName, $bad, $hits.Count, $quarantine)
         }
     }
 
-    # 2. No good checkpoint: a scratch start, or review.
+    # 2. No logged checkpoint: a scratch start when at most episode 1 ran (ruling R12a: a stop
+    #    before or during the first save), otherwise review.
     $good = Get-GoodCheckpoint $ProjectRoot $RunName
-    $entries = @(Get-CheckpointEntries $modelDir)
     if ($good -lt 0) {
-        if ($entries.Count -gt 0) { return "NEEDS_REVIEW:model\ has $($entries.Count) checkpoint-* file(s) but no checkpoint is complete and logged as saved" }
         $tr = Read-CsvFile (Join-Path $store 'train_reward.csv')
-        if (-not $tr.Ok) { return "NEEDS_REVIEW:train_reward.csv does not parse ($($tr.Error))" }
-        if ($tr.Rows.Count -gt 0) { return "NEEDS_REVIEW:no checkpoint in model\ but train_reward.csv has $($tr.Rows.Count) row(s)" }
+        if (-not $tr.Ok) { return "NEEDS_REVIEW:no logged checkpoint and train_reward.csv does not parse ($($tr.Error))" }
+        $leftovers = @(Get-CheckpointEntries $modelDir -WithState)
+        if ($tr.Rows.Count -gt 1) {
+            if ($leftovers.Count -gt 0) {
+                return "NEEDS_REVIEW:model\ has $($leftovers.Count) checkpoint file(s) but none is complete and logged as saved, and train_reward.csv has $($tr.Rows.Count) rows"
+            }
+            return "NEEDS_REVIEW:no checkpoint in model\ but train_reward.csv has $($tr.Rows.Count) rows"
+        }
+        foreach ($e in $leftovers) { Move-ToFolder $e.FullName $quarantine }
+        if ($leftovers.Count -gt 0) {
+            & $say ('no logged checkpoint; moved {0} to {1}' -f (($leftovers | ForEach-Object { $_.Name }) -join ', '), $quarantine)
+        }
         $partial = @('train_reward.csv', 'agent_reward.csv', 'episode_cost.csv' |
             ForEach-Object { Join-Path $store $_ } | Where-Object { [IO.File]::Exists($_) })
         foreach ($p in $partial) { Move-ToFolder $p $recovery }
-        if ($partial.Count -gt 0) { & $say ("no checkpoint; moved {0} partial CSV(s) to {1}" -f $partial.Count, $recovery) }
+        if ($partial.Count -gt 0) { & $say ('no logged checkpoint; moved {0} CSV(s) to {1}' -f $partial.Count, $recovery) }
         return 'SCRATCH'
     }
+    $entries = @(Get-CheckpointEntries $modelDir)
 
     # 3. Validate and plan the CSV trim before moving anything.
     $plan = Get-CsvRepairPlan $store $good $Cfg
@@ -974,10 +1036,12 @@ function Test-EvalAttempt {
     )
     $ErrorActionPreference = 'Stop'
     # Spec 8 checks of one evaluation attempt (its eval_rN.log, the matching .exit file and the
-    # level folders it wrote) -> { Ok; FailedLevels ('1.10' strings, for --levels); Reason }.
-    # $Levels: the levels this attempt ran (default: the config's eval_levels). The trips
-    # check also reads the trip CSVs of the config's other levels (earlier attempts).
-    # When the attempt fails but no single level can be blamed, every level is failed.
+    # level folders it wrote) -> { Ok; FailedLevels ('1.10' strings, for --levels); Reason;
+    # Warnings }. $Levels: the levels this attempt ran (default: the config's eval_levels).
+    # The trips check also reads the trip CSVs of the config's other levels (earlier attempts);
+    # it fails a fall in mean trips per episode only up to f1.20 - a fall at a higher (stress)
+    # level is reported in Warnings. When the attempt fails but no single level can be blamed,
+    # every level is failed.
     Assert-AbsolutePath $LogPath 'Test-EvalAttempt log path'
     if ($null -eq $Levels -or $Levels.Count -eq 0) { $Levels = [double[]]$Cfg.EvalLevels }
     $rel = Get-StoreRel $RunName
@@ -1085,12 +1149,17 @@ function Test-EvalAttempt {
         $mean = Get-TripMean (Get-LevelDir $ProjectRoot $RunName $lv) $Cfg
         if ($null -ne $mean) { $means[$tag] = [pscustomobject]@{ Tag = $tag; Level = $lv; Mean = $mean; InAttempt = $false } }
     }
+    # Up to f1.20 a fall fails; above it (the f2.00 stress level, which can gridlock with
+    # teleporting off and so insert fewer vehicles) a fall is only a warning.
+    $warnings = New-Object System.Collections.Generic.List[string]
     $chain = @($means.Values | Sort-Object Level)
     for ($i = 1; $i -lt $chain.Count; $i++) {
         $a = $chain[$i - 1]
         $b = $chain[$i]
         if ($b.Mean -lt $a.Mean) {
-            $reasons.Add([string]::Format($QueueInvariant, 'mean trips per episode fall from {0} at f{1} to {2} at f{3}', $a.Mean, $a.Tag, $b.Mean, $b.Tag))
+            $msg = [string]::Format($QueueInvariant, 'mean trips per episode fall from {0} at f{1} to {2} at f{3}', $a.Mean, $a.Tag, $b.Mean, $b.Tag)
+            if ($b.Level -gt $QueueTripsCheckMaxLevel + 1e-9) { $warnings.Add($msg + ' (stress level, not failed)'); continue }
+            $reasons.Add($msg)
             # Blame the higher level (the one that fell); the lower one only when the higher
             # level is from an earlier attempt.
             if ($b.InAttempt) { $failed[$b.Tag] = $true }
@@ -1104,7 +1173,7 @@ function Test-EvalAttempt {
     $failedLevels = @($tags | Where-Object { $failed.ContainsKey($_) })
     $reason = 'ok'
     if (-not $ok) { $reason = $reasons -join '; ' }
-    [pscustomobject]@{ Ok = $ok; FailedLevels = [string[]]$failedLevels; Reason = $reason }
+    [pscustomobject]@{ Ok = $ok; FailedLevels = [string[]]$failedLevels; Reason = $reason; Warnings = [string[]]$warnings.ToArray() }
 }
 
 # ---------------------------------------------------------------------------------------------
