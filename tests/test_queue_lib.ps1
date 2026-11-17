@@ -223,6 +223,18 @@ try {
     $threw = $false
     try { Write-Utf8NoBom 'relative\x.txt' 'x' } catch { $threw = $true }
     if (-not $threw) { throw 'Write-Utf8NoBom accepted a relative path' }
+    # The flushed writer (Recovery's CSV temp files, state.json.tmp): same bytes, no BOM.
+    $p3 = Join-Path $TestRoot 'nobom\sub dir\durable.csv'
+    Write-Utf8NoBomDurable $p3 "a,b`r`ncaf$([char]0xE9),2`r`n"
+    if (-not (Test-NoBom $p3)) { throw 'Write-Utf8NoBomDurable wrote a BOM' }
+    if (-not ([IO.File]::ReadAllText($p3, $Utf8) -eq "a,b`r`ncaf$([char]0xE9),2`r`n")) { throw 'Write-Utf8NoBomDurable text did not round-trip' }
+    Write-Utf8NoBomDurable $p3 'x'
+    if (-not ([IO.File]::ReadAllText($p3, $Utf8) -eq 'x')) { throw 'Write-Utf8NoBomDurable did not truncate a longer existing file' }
+    Write-Utf8NoBomDurable $p3 ''
+    if (-not ((Get-Item -LiteralPath $p3).Length -eq 0)) { throw 'Write-Utf8NoBomDurable of an empty text should leave an empty file' }
+    $threw = $false
+    try { Write-Utf8NoBomDurable 'relative\x.txt' 'x' } catch { $threw = $true }
+    if (-not $threw) { throw 'Write-Utf8NoBomDurable accepted a relative path' }
 
     # -----------------------------------------------------------------------------------------
     # Read-SharedText: a log another handle is writing (FileShare.ReadWrite)
@@ -338,6 +350,8 @@ try {
     foreach ($f in 'train_reward.csv', 'agent_reward.csv', 'episode_cost.csv') {
         if (-not (Test-NoBom (Join-Path $store $f))) { throw "$f was rewritten with a BOM" }
     }
+    $qtmp = @(Get-ChildItem -LiteralPath $store -Filter '*.qtmp' -Force)
+    if ($qtmp.Count -gt 0) { throw "Recovery left temp files: $(($qtmp | ForEach-Object { $_.Name }) -join ', ')" }
     $rd = Get-Dirs $queue 'recovery_*'
     if (-not ($rd.Count -eq 1)) { throw "expected one recovery folder, got $($rd.Count)" }
     if (-not ((Get-DataLines (Join-Path $rd[0].FullName 'train_reward.csv')).Count -eq 3)) { throw 'recovery folder lacks the original 2-row train_reward.csv' }
@@ -638,6 +652,7 @@ try {
     $store = New-CompleteStore $proj 'arm_e'
     $tc = Test-TrainingComplete $proj 'arm_e' $cfg -ProcessAlive $false
     if (-not $tc.Ok) { throw "complete training judged incomplete: $($tc.Reason)" }
+    if ($null -ne $tc.Warning) { throw "an exit-0 complete run has a warning: $($tc.Warning)" }
     $tc = Test-TrainingComplete $proj 'arm_e' $cfg -ProcessAlive $true
     if ($tc.Ok -or $tc.Reason -notlike '*alive*') { throw 'a live process of the run should make training incomplete' }
     $tc = Test-TrainingComplete $proj 'arm_e' $cfg    # real process check: nothing runs this run name
@@ -651,8 +666,33 @@ try {
     if (-not ((Get-RunStage $proj 'arm_e' $cfg -ProcessAlive $false) -eq 'FAILED')) { throw 'a FAILED marker should give FAILED' }
     if (-not ((Get-RunStage $proj 'never_launched' $cfg -ProcessAlive $false) -eq 'TRAIN')) { throw 'a run without a store should be TRAIN' }
 
+    # A non-zero exit AFTER the COMPLETE line (a TensorFlow crash at teardown) is accepted with a
+    # warning when every other condition holds; without the COMPLETE line exit 0 is required.
+    $s = New-CompleteStore $proj 'arm_e2'
+    Put (Join-Path $s 'logs\launch_r1.exit') "EXIT=-1073741819 at Fri 11/13/2026 14:00:00.00 `r`n"
+    $tc = Test-TrainingComplete $proj 'arm_e2' $cfg -ProcessAlive $false
+    if (-not $tc.Ok) { throw "a complete run that crashed after its COMPLETE line was judged incomplete: $($tc.Reason)" }
+    if (-not ($tc.Warning -like "launch_r1 exited -1073741819 after its '>>> TRAINING COMPLETE step 288' line*" -and $tc.Reason -like 'training complete; warning: launch_r1 exited -1073741819*')) { throw "the non-zero exit should be a warning: '$($tc.Warning)' / '$($tc.Reason)'" }
+    if (-not ((Get-RunStage $proj 'arm_e2' $cfg -ProcessAlive $false) -eq 'EVALUATE')) { throw 'a complete run that exited non-zero after COMPLETE should be EVALUATE' }
+    $tc = Test-TrainingComplete $proj 'arm_e2' $cfg -ProcessAlive $true
+    if ($tc.Ok -or $tc.Reason -notlike 'launch_r1 exited -1073741819; a python or SUMO process of the run is alive*') { throw "a non-zero exit with a live process: Ok $($tc.Ok), reason '$($tc.Reason)'" }
+    $s = New-CompleteStore $proj 'arm_e3'
+    Put (Join-Path $s 'logs\launch_r1.exit') "EXIT=1 at Fri 11/13/2026 14:00:00.00 `r`n"
+    Remove-Item -LiteralPath (Join-Path $s 'model\checkpoint-288.meta')
+    $tc = Test-TrainingComplete $proj 'arm_e3' $cfg -ProcessAlive $false
+    if ($tc.Ok -or $null -ne $tc.Warning -or $tc.Reason -notlike 'launch_r1 exited 1; checkpoint-288 lacks*') { throw "a non-zero exit with another condition failing: Ok $($tc.Ok), reason '$($tc.Reason)'" }
+    $s = New-CompleteStore $proj 'arm_e4'
+    Put (Join-Path $s 'logs\launch_r1.exit') "EXIT=1 at Fri 11/13/2026 14:00:00.00 `r`n"
+    Put (Join-Path $s 'logs\launch_r1.log') (Get-Lines @((Get-SavedLine 'arm_e4' 144), (Get-SavedLine 'arm_e4' 288)))
+    $tc = Test-TrainingComplete $proj 'arm_e4' $cfg -ProcessAlive $false
+    if ($tc.Ok -or $tc.Reason -notlike "launch_r1 exited 1; launch_r1.log has no '>>> TRAINING COMPLETE step 288' line*") { throw "exit 1 without the COMPLETE line: Ok $($tc.Ok), reason '$($tc.Reason)'" }
+    Put (Join-Path $s 'logs\launch_r1.exit') $ExitOk
+    $tc = Test-TrainingComplete $proj 'arm_e4' $cfg -ProcessAlive $false
+    if ($tc.Ok -or $tc.Reason -notlike "launch_r1.log has no '>>> TRAINING COMPLETE step 288' line*") { throw "exit 0 without the COMPLETE line: Ok $($tc.Ok), reason '$($tc.Reason)'" }
+
     $bad = @{
-        'exit 1'          = { param($s) Put (Join-Path $s 'logs\launch_r1.exit') "EXIT=1 at Fri 11/13/2026 14:00:00.00 `r`n" }
+        'exit 1, no COMPLETE' = { param($s) Put (Join-Path $s 'logs\launch_r1.exit') "EXIT=1 at Fri 11/13/2026 14:00:00.00 `r`n"; Put (Join-Path $s 'logs\launch_r1.log') (Get-Lines @('>>> Starting trainer.run()')) }
+        'complete, exit 1, newer launch' = { param($s) Put (Join-Path $s 'logs\launch_r1.exit') "EXIT=1 at Fri 11/13/2026 14:00:00.00 `r`n"; Put (Join-Path $s 'logs\launch_r2.log') (Get-Lines @('>>> Starting trainer.run()')) }
         'no exit file'    = { param($s) Remove-Item -LiteralPath (Join-Path $s 'logs\launch_r1.exit') }
         'complete 144'    = { param($s) Put (Join-Path $s 'logs\launch_r1.log') (Get-Lines @('>>> TRAINING COMPLETE step 144')) }
         'newer launch'    = { param($s) Put (Join-Path $s 'logs\launch_r2.log') (Get-Lines @('>>> Starting trainer.run()')) }

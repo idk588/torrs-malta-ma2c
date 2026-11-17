@@ -168,6 +168,41 @@ try {
     Check ((Get-EvalTimeoutReason $t0.AddMinutes(151) $t0 $true '2.00' 240 150) -match 'level f2\.00 exceeded') 'level over its limit'
     Check ($null -eq (Get-EvalTimeoutReason $t0.AddMinutes(149) $t0 $true '2.00' 240 150)) 'level within its limit'
 
+    # Final-review fix 1: a stress level above 1.20 gets 8 x the f1.00 time, at least 360 min;
+    # levels up to 1.20 keep 3 x, at least 90 min.
+    Check ((Get-EvalLevelLimitMinutes 50.0 $null 10 '2.00') -eq 400) 'f2.00: 8 x measured f1.00'
+    Check ((Get-EvalLevelLimitMinutes 30.0 $null 10 '2.00') -eq 360) 'f2.00: at least 360 min'
+    Check ((Get-EvalLevelLimitMinutes 50.0 $null 10 2.0) -eq 400) 'f2.00 given as a number'
+    Check ((Get-EvalLevelLimitMinutes $null ([double[]]@(300, 600, 900)) 10 '2.00') -eq 800) 'f2.00 estimate: 8 x 10 seeds x median 600 s'
+    Check ((Get-EvalLevelLimitMinutes $null $null 10 '2.00') -eq 360) 'f2.00 with no data: 360 min'
+    foreach ($lvl in '1.00', '1.06', '1.10', '1.13', '1.20') {
+        Check ((Get-EvalLevelLimitMinutes 50.0 $null 10 $lvl) -eq 150) "f$lvl keeps 3 x measured f1.00"
+        Check ((Get-EvalLevelLimitMinutes 10.0 $null 10 $lvl) -eq 90) "f$lvl keeps the 90 min floor"
+    }
+    Check ((Get-EvalLevelLimitMinutes 50.0 $null 10 1.2) -eq 150) '1.2 as a number is not a stress level'
+    Check ((Test-StressLevel '1.21') -and -not (Test-StressLevel '1.20') -and -not (Test-StressLevel $null) -and -not (Test-StressLevel 'x')) 'Test-StressLevel'
+    $saved = [Threading.Thread]::CurrentThread.CurrentCulture
+    try {
+        [Threading.Thread]::CurrentThread.CurrentCulture = [cultureinfo]'de-DE'
+        Check ((Get-EvalLevelLimitMinutes 50.0 $null 10 2.0) -eq 400 -and (Get-EvalLevelLimitMinutes 50.0 $null 10 '1.20') -eq 150) 'stress level under de-DE'
+    } finally { [Threading.Thread]::CurrentThread.CurrentCulture = $saved }
+    $sj = [pscustomobject]@{ CurrentLevel = $null; LevelSeen = $false; DoneLevels = 0; Levels = @(); Cfg = [pscustomobject]@{ EvalLevels = [double[]]@(1.0, 1.06, 1.1, 1.13, 1.2, 2.0) } }
+    Check ($null -eq (Get-JobLevelForLimit $sj)) 'no level before the first START'
+    $sj.LevelSeen = $true; $sj.CurrentLevel = '1.20'; $sj.DoneLevels = 4
+    Check ((Get-JobLevelForLimit $sj) -eq '1.20') 'the level in progress'
+    $sj.CurrentLevel = $null; $sj.DoneLevels = 5
+    Check ((Get-JobLevelForLimit $sj) -eq '2.00') 'after f1.20 DONE the next level (f2.00) sets the limit'
+    $sj.DoneLevels = 6
+    Check ($null -eq (Get-JobLevelForLimit $sj)) 'after the last level: none'
+    $sj.Levels = @('1.10', '2.00'); $sj.DoneLevels = 1
+    Check ((Get-JobLevelForLimit $sj) -eq '2.00') 'a --levels retry: the next of its levels'
+
+    # Final-review fix 3: the gap limit is a parameter (arms.<arm>.checkpoint_gap_min).
+    $w = Get-TrainWatchdogReason -Now $t0.AddMinutes(520) -Started $t0 -LastCheckpoint $t0.AddMinutes(420) -FirstLimitMin 240 -GapMin 150 -SaveErrorAt $null
+    Check ($null -eq $w) 'a 150 min gap limit allows 100 min'
+    $w = Get-TrainWatchdogReason -Now $t0.AddMinutes(420.1) -Started $t0 -LastCheckpoint $t0.AddMinutes(420) -FirstLimitMin 240 -GapMin 0.05 -SaveErrorAt $null
+    Check ($w -match 'for 0\.1 min \(limit 0\.05 min\)') "a fractional gap limit is printed: $w"
+
     # Refusals (fix round 1): exit 2 or 4 AND main.py's refusal text at the end of the log.
     $abortTail = "2026-11-16 10:00:00,000 [INFO] step 100`r`nFatal Python error: Aborted`r`n`r`nCurrent thread 0x00001234 (most recent call first):`r`n  File `"main.py`", line 1 in <module>`r`n"
     Check (-not (Test-RefusalExit 3 $abortTail)) 'exit 3 from a native abort is not a refusal'
@@ -276,6 +311,14 @@ try {
     Check ($ini -eq (Join-Path $proj 'config\runs\_smoke_fog.ini')) 'ini falls back to config\runs before the first launch'
     Check ((Get-RunArm $ini) -eq 'fog') 'arm from comm_arch'
     Check ($null -eq (Get-RunIniPath 'nothing_here')) 'no ini -> $null'
+    # Final-review fix 3: the job's limits come from the run's arm in state.json.
+    $lj0 = New-JobRecord -RunName '_smoke_fog' -Cfg $smokeCfg -Kind 'train' -N 1 -Started $t0 -CmdPid $null -PyPid 1 -GoodBefore -1 -Levels $null
+    Set-JobLimits $lj0 ([ordered]@{ version = 1; runs = [ordered]@{} })
+    Check ($lj0.FirstLimitMin -eq 240 -and $lj0.GapMin -eq 90) 'default limits: 240 min first checkpoint, 90 min gap'
+    Set-JobLimits $lj0 ([ordered]@{ version = 1; runs = [ordered]@{}; arms = [ordered]@{ fog = [ordered]@{ first_checkpoint_min = 300; checkpoint_gap_min = 125.5 }; cloud = [ordered]@{ checkpoint_gap_min = 10 } } })
+    Check ($lj0.FirstLimitMin -eq 300 -and $lj0.GapMin -eq 125.5) "arms.fog limits are honoured: $($lj0.FirstLimitMin) / $($lj0.GapMin)"
+    Set-JobLimits $lj0 ([ordered]@{ version = 1; runs = [ordered]@{}; arms = [ordered]@{ fog = [ordered]@{ checkpoint_gap_min = 0 } } })
+    Check ($lj0.GapMin -eq 90) 'a zero gap falls back to 90 min'
 
     $st = Read-QueueState $Q.QueueDir
     $d = Get-RunDecision '_smoke_fog' $st
@@ -427,6 +470,57 @@ try {
     Check ($d.Stage -eq 'FAILED' -and $d.Text -match 'FAILED \(STUCK\)' -and -not $d.Actionable) "decision with a FAILED marker: $($d.Text)"
 
     # -----------------------------------------------------------------------------------------
+    # Final-review fix 4: cross-run warnings (queue.log only, never a failure)
+    # -----------------------------------------------------------------------------------------
+    $xp = New-FakeProject 'p3 (xrun) x'
+    foreach ($arm in 'cloud', 'fog', 'hybrid') { Put (Join-Path $xp ('config\runs\xr_' + $arm + '.ini')) ($SmokeIni -replace 'comm_arch = fog', ('comm_arch = ' + $arm)) }
+    Put (Join-Path $xp 'config\queue_x.txt') "xr_cloud`nxr_fog`nxr_hybrid`n"
+    Initialize-RunnerContext -ProjectRoot $xp -QueueFile 'config/queue_x.txt' -PythonExe $py -DryRun $false
+    $xlog = Join-Path $xp 'Malta\runs\_queue\queue.log'
+    # Code: the previous DONE run's first launch against this run's first launch.
+    Check ($null -eq (Compare-CrossRunCode (Get-CodeHashLines 'xr_fog') $null)) 'no previous DONE run: nothing to compare'
+    Check ($null -eq (Compare-CrossRunCode (Get-CodeHashLines 'xr_fog') 'xr_cloud')) 'a previous run without a launch: nothing to compare'
+    Put (Join-Path $xp 'Malta\runs\xr_cloud\logs\launch_r1.code.txt') ("# code hashes for launch_r1 of xr_cloud`r`n" + (@(Get-CodeHashLines 'xr_cloud') -join "`r`n") + "`r`n")
+    Put (Join-Path $xp 'Malta\runs\xr_cloud\logs\launch_r2.code.txt') "# a later launch, ignored`r`nxx  utils.py`r`n"
+    $fogLines = Get-CodeHashLines 'xr_fog'
+    Check ((@($fogLines) -join "`n") -match '  config\.ini' -and (@(Get-CodeHashLines 'xr_cloud') -join "`n") -ne (@($fogLines) -join "`n")) 'precondition: the two runs differ in config.ini'
+    $x = Compare-CrossRunCode $fogLines 'xr_cloud'
+    Check ($null -ne $x -and $x.Same -and $x.Detail -match 'launch_r1\.code\.txt') "same code apart from config.ini: $($x.Detail)"
+    Write-CrossRunCodeCheck 'xr_fog' $fogLines 'xr_cloud'
+    Check ((Read-SharedText $xlog) -match 'xr_fog: first launch: same code as the first launch of xr_cloud' -and (Read-SharedText $xlog) -notmatch 'WARNING') 'a match is logged without a warning'
+    Put (Join-Path $xp 'utils.py') "# changed between the runs`n"
+    Put (Join-Path $xp 'agents\new_policy.py') "# new`n"
+    $fogLines = Get-CodeHashLines 'xr_fog'
+    $x = Compare-CrossRunCode $fogLines 'xr_cloud'
+    Check ($null -ne $x -and -not $x.Same -and $x.Detail -match 'utils\.py' -and $x.Detail -match 'agents\\new_policy\.py \(new\)' -and $x.Detail -notmatch 'config\.ini' -and $x.Detail -notmatch 'main\.py') "changed code is listed, config.ini is not: $($x.Detail)"
+    Write-CrossRunCodeCheck 'xr_fog' $fogLines 'xr_cloud'
+    Check ((Read-SharedText $xlog) -match 'xr_fog: WARNING: first launch: code differs from the first launch of xr_cloud \(xr_cloud\\logs\\launch_r1\.code\.txt\): .*utils\.py.*\(not a failure\)') "the code difference is a WARNING in queue.log: $(Read-SharedText $xlog)"
+    $nWarn = ([regex]::Matches((Read-SharedText $xlog), 'xr_fog: WARNING: first launch: code differs')).Count
+    Put (Join-Path $xp 'Malta\runs\xr_cloud\logs\launch_r1.code.txt') "not a hash line`r`n"
+    Write-CrossRunCodeCheck 'xr_fog' $fogLines 'xr_cloud'
+    Check (([regex]::Matches((Read-SharedText $xlog), 'xr_fog: WARNING: first launch: code differs')).Count -eq $nWarn + 1) 'a garbled code file of the other run still only warns'
+    # Neighbour maps: hybrid against fog (spec 5: hybrid uses the fog maps).
+    Check (@(Compare-HybridNeighbourHash 'xr_hybrid').Count -eq 0) 'no hybrid neighbours.sha256 yet: nothing to compare'
+    Put (Join-Path $xp 'Malta\runs\xr_hybrid\neighbours.sha256') "abc123`n"
+    Check (@(Compare-HybridNeighbourHash 'xr_hybrid').Count -eq 0) 'no fog neighbours.sha256: nothing to compare'
+    Put (Join-Path $xp 'Malta\runs\xr_fog\neighbours.sha256') "abc123`n"
+    Put (Join-Path $xp 'Malta\runs\xr_cloud\neighbours.sha256') "fff999`n"
+    $nl = @(Compare-HybridNeighbourHash 'xr_hybrid')
+    Check ($nl.Count -eq 1 -and $nl[0] -match 'xr_hybrid: neighbours\.sha256 matches fog run xr_fog' -and $nl[0] -notmatch 'WARNING') "equal hashes match (the cloud run is not compared): $($nl -join ' | ')"
+    Check (@(Compare-HybridNeighbourHash 'xr_fog').Count -eq 0 -and @(Compare-HybridNeighbourHash 'xr_cloud').Count -eq 0) 'only a hybrid run is checked'
+    Put (Join-Path $xp 'Malta\runs\xr_fog\neighbours.sha256') "abd124`n"
+    $nl = @(Compare-HybridNeighbourHash 'xr_hybrid')
+    Check ($nl.Count -eq 1 -and $nl[0] -match 'xr_hybrid: WARNING: neighbours\.sha256 abc123 differs from fog run xr_fog \(abd124\)') "different hashes warn: $($nl -join ' | ')"
+    Put (Join-Path $xp 'Malta\runs\xr_fog\DONE') 'DONE'
+    Check (@(Compare-HybridNeighbourHash 'xr_hybrid').Count -eq 1) 'a DONE fog run is compared'
+    Write-HybridNeighbourCheck 'xr_hybrid'
+    Write-HybridNeighbourCheck 'xr_hybrid'
+    Check (([regex]::Matches((Read-SharedText $xlog), 'xr_hybrid: WARNING: neighbours\.sha256')).Count -eq 1) 'the neighbour check is logged once per runner process'
+    Put (Join-Path $xp 'Malta\runs\xr_fog\FAILED') 'STUCK'
+    Check (@(Compare-HybridNeighbourHash 'xr_hybrid').Count -eq 0) 'a FAILED fog run is not compared'
+    Initialize-RunnerContext -ProjectRoot $proj -QueueFile 'config/queue_smoke.txt' -PythonExe $py -DryRun $true -ChecksDir (Join-Path $proj 'Malta\runs\_queue\checks')
+
+    # -----------------------------------------------------------------------------------------
     # Single instance: a held mutex is reported; a dead owner's (abandoned) mutex is taken.
     # A test-only mutex name, so a real runner is never affected.
     # -----------------------------------------------------------------------------------------
@@ -441,11 +535,63 @@ try {
         while ((Get-Date) -lt $deadline) { $probe = Get-MutexProbe; if ($probe -match '^held') { break }; Start-Sleep -Milliseconds 300 }
         Check ($probe -match '^held') "a mutex held by another process is reported held: $probe"
         Check (-not (Enter-RunnerMutex $keep 0)) 'a second copy does not get a held mutex'
+        # Final-review fix 2: -ResetRun is refused while a runner holds the mutex.
+        $fpText = [IO.File]::ReadAllText($fp)
+        $out = @(Invoke-ResetRun '_smoke_fog')
+        Check ($out.Count -eq 1 -and $out[0] -eq 1 -and [IO.File]::Exists($fp) -and [IO.File]::ReadAllText($fp) -eq $fpText) "ResetRun refused while a runner holds the mutex: $($out -join ' | ')"
         $holder.WaitForExit(30000) | Out-Null
         Check $holder.HasExited 'the holder process exited'
         Check (Enter-RunnerMutex $keep 0) 'an abandoned mutex counts as ownership'
         $keep.ReleaseMutex()
         Check ((Get-MutexProbe) -match '^free') 'free again after release'
+
+        # -------------------------------------------------------------------------------------
+        # Final-review fix 2: -ResetRun <name> (still on the test mutex name)
+        # -------------------------------------------------------------------------------------
+        Initialize-RunnerContext -ProjectRoot $proj -QueueFile 'config/queue_smoke.txt' -PythonExe $py -DryRun $false
+        $stR = Read-QueueState $Q.QueueDir
+        $rcR = Get-RunCounters $stR '_smoke_fog'
+        $rcR['launches'] = 12; $rcR['no_progress'] = 3; $rcR['interrupted'] = 2; $rcR['good_at_launch'] = @(-1, 144)
+        $rcR['eval_attempts'] = 2; $rcR['eval_launches'] = 6; $rcR['eval_levels_next'] = @('1.10')
+        Save-QueueState $Q.QueueDir $stR
+        $resetLogs = Join-Path $proj 'Malta\runs\_smoke_fog\logs'
+        $logsBefore = @(Get-ChildItem -LiteralPath $resetLogs | ForEach-Object { $_.Name } | Sort-Object)
+        $origTable = ${function:Get-ProcessTable}
+        try {
+            ${function:Get-ProcessTable} = { @((New-Proc 900 1 'python.exe' '"C:\Program Files\Python311\python.exe" -X faulthandler main.py --run cloud_base --option train' (Get-Date))) }
+            $out = @(Invoke-ResetRun '_smoke_fog')
+            Check ($out.Count -eq 1 -and $out[0] -eq 1 -and [IO.File]::Exists($fp)) "ResetRun refused while a queue python is alive: $($out -join ' | ')"
+            Check ((Read-QueueState $Q.QueueDir)['runs']['_smoke_fog']['launches'] -eq 12) 'a refused reset changes no counter'
+            ${function:Get-ProcessTable} = { @((New-Proc 901 1 'python.exe' 'python tools\check_env.py --arm fog --port 20' (Get-Date))) }
+            Check (@(Get-QueuePythonList @(Get-ProcessTable)).Count -eq 0) 'a python that is not a queue launch does not block a reset'
+        } finally { ${function:Get-ProcessTable} = $origTable }
+        foreach ($badName in 'Fog', '..\signal_route') {
+            $out = @(Invoke-ResetRun $badName)
+            Check ($out.Count -eq 1 -and $out[0] -eq 1) "ResetRun refuses the run name '$badName'"
+        }
+        $out = @(Invoke-ResetRun 'nothing_here')
+        Check ($out.Count -eq 1 -and $out[0] -eq 1) 'ResetRun refuses a run without a store'
+        $out = @(Invoke-ResetRun '_smoke_fog')
+        Check ($out.Count -eq 1 -and $out[0] -eq 0) "ResetRun returns 0: $($out -join ' | ')"
+        Check (-not [IO.File]::Exists($fp)) 'the FAILED marker was moved away'
+        $kept = @(Get-ChildItem -LiteralPath $resetLogs -Filter 'FAILED_*.txt')
+        Check ($kept.Count -eq 1 -and $kept[0].Name -match '^FAILED_\d{8}_\d{6}\.txt$' -and [IO.File]::ReadAllText($kept[0].FullName) -eq $fpText) 'the FAILED marker is kept, unchanged, as logs\FAILED_<stamp>.txt'
+        $logsAfter = @(Get-ChildItem -LiteralPath $resetLogs | Where-Object { $_.Name -notlike 'FAILED_*' } | ForEach-Object { $_.Name } | Sort-Object)
+        Check (($logsAfter -join '|') -eq ($logsBefore -join '|')) 'nothing launched (no new log files)'
+        $rcR = (Read-QueueState $Q.QueueDir)['runs']['_smoke_fog']
+        Check ($rcR['launches'] -eq 0 -and $rcR['no_progress'] -eq 0 -and $rcR['eval_attempts'] -eq 0 -and $rcR['eval_launches'] -eq 0 -and @($rcR['eval_levels_next']).Count -eq 0) "counters reset: $(ConvertTo-Json $rcR -Compress -Depth 6)"
+        Check ($rcR['interrupted'] -eq 2 -and @($rcR['good_at_launch']).Count -eq 2) 'interrupted and good_at_launch are kept'
+        $rsR = @($rcR['resets'])
+        Check ($rsR.Count -eq 1 -and $rsR[0]['failed'] -eq 'STUCK' -and $rsR[0]['launches'] -eq 12 -and $rsR[0]['no_progress'] -eq 3 -and $rsR[0]['eval_attempts'] -eq 2 -and $rsR[0]['eval_launches'] -eq 6 -and (@($rsR[0]['eval_levels_next']) -join ',') -eq '1.10') "the old values are kept in resets: $(ConvertTo-Json $rsR -Compress -Depth 6)"
+        Check ((Read-SharedText $Q.LogFile) -match '_smoke_fog: ResetRun \(pid \d+\): FAILED \(STUCK\) moved to .*\\logs\\FAILED_\d{8}_\d{6}\.txt; state\.json counters reset: launches 12 -> 0, no_progress 3 -> 0, eval_attempts 2 -> 0, eval_launches 6 -> 0, eval_levels_next \[1\.10\] -> \[\]') "the reset is logged in queue.log: $(Read-SharedText $Q.LogFile)"
+        $d = Get-RunDecision '_smoke_fog' (Read-QueueState $Q.QueueDir)
+        Check ($d.Stage -eq 'TRAIN' -and $d.Actionable) "after the reset the run trains again: $($d.Text)"
+        $out = @(Invoke-ResetRun '_smoke_fog')
+        Check ($out.Count -eq 1 -and $out[0] -eq 0 -and @((Read-QueueState $Q.QueueDir)['runs']['_smoke_fog']['resets']).Count -eq 2) 'a second reset (no FAILED marker) only resets the counters again'
+        Check ((Read-SharedText $Q.LogFile) -match '_smoke_fog: ResetRun \(pid \d+\): no FAILED marker was present') 'the second reset is logged'
+        # A STUCK verdict after the reset starts from fresh counters again.
+        Check ((Update-LaunchCounters (Read-QueueState $Q.QueueDir) '_smoke_fog' 144 144 $false) -eq 'OK') 'the counters allow new launches after a reset'
+        Initialize-RunnerContext -ProjectRoot $proj -QueueFile 'config/queue_smoke.txt' -PythonExe $py -DryRun $true -ChecksDir (Join-Path $proj 'Malta\runs\_queue\checks')
     } finally { $keep.Dispose() }
 
     # The parts below start python processes; they are skipped while a real runner is active,
@@ -471,6 +617,25 @@ try {
     Check ($res.Output.Contains('UTF8 ' + [string][char]0x017C)) 'UTF-8 output'
     $exitText = [IO.File]::ReadAllText((Join-Path $proj2 'Malta\runs\_queue\checks (2)\fake launch.exit'))
     Check ($exitText -match '^EXIT=7 at ') "exit file: $exitText"
+
+    # Final-review fix 2, end to end: 'run_queue.ps1 -ResetRun <name> -ProjectRoot <fake>' as the
+    # author runs it (the real mutex name, held only for the reset; skipped while a real runner
+    # is active).
+    $proj4 = New-FakeProject 'p4 (reset) x'
+    Put (Join-Path $proj4 'Malta\runs\_smoke_fog\FAILED') "EVAL_FAILED`r`neval_r2: level f2.00 exceeded its time limit`r`nwritten by a test`r`n"
+    Put (Join-Path $proj4 'Malta\runs\_queue\state.json') '{ "version": 1, "runs": { "_smoke_fog": { "launches": 1, "no_progress": 0, "interrupted": 0, "good_at_launch": [ -1 ], "eval_attempts": 2, "eval_launches": 2, "eval_levels_next": [ "2.00" ], "current_launch": null } }, "arms": { "fog": { "checkpoint_gap_min": 120 } } }'
+    $script4 = Join-Path $RealRoot 'tools\run_queue.ps1'
+    $o = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $script4 -ResetRun '_smoke_fog' -ProjectRoot $proj4 -QueueFile 'config/queue_smoke.txt'
+    $code4 = $LASTEXITCODE
+    $oText = ($o | ForEach-Object { [string]$_ }) -join "`n"
+    Check ($code4 -eq 0 -and $oText -match 'ResetRun _smoke_fog \(nothing launched\)' -and $oText -match 'FAILED \(EVAL_FAILED\) moved to' -and $oText -match 'eval_attempts 2 -> 0, eval_launches 2 -> 0, eval_levels_next \[2\.00\] -> \[\]') "the -ResetRun command: exit $code4`n$oText"
+    $st4 = Read-QueueState (Join-Path $proj4 'Malta\runs\_queue')
+    Check (-not [IO.File]::Exists((Join-Path $proj4 'Malta\runs\_smoke_fog\FAILED')) -and @(Get-ChildItem -LiteralPath (Join-Path $proj4 'Malta\runs\_smoke_fog\logs') -Filter 'FAILED_*.txt').Count -eq 1) 'the command moved FAILED into logs'
+    Check ($st4['runs']['_smoke_fog']['eval_attempts'] -eq 0 -and $st4['arms']['fog']['checkpoint_gap_min'] -eq 120) 'the command reset the counters and kept the rest of state.json'
+    $o = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $script4 -ResetRun 'Fog_x' -ProjectRoot $proj4
+    Check ($LASTEXITCODE -eq 1) "-ResetRun with a bad run name exits 1: $(($o | ForEach-Object { [string]$_ }) -join ' ')"
+    $o = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $script4 -ResetRun '_smoke_fog' -DryRun -ProjectRoot $proj4
+    Check ($LASTEXITCODE -eq 1 -and (($o | ForEach-Object { [string]$_ }) -join ' ') -match 'cannot be combined with -DryRun') '-ResetRun with -DryRun is refused'
     }
 
     # -----------------------------------------------------------------------------------------
@@ -544,6 +709,10 @@ if opt == 'train':
         sys.exit(0)
     if 'nan' in run:
         episode(144, 12, '')
+        time.sleep(120)
+        sys.exit(0)
+    if 'gap' in run and not os.path.exists(store + 'model/checkpoint-144.index'):
+        episode(144, 12, '-12.5')
         time.sleep(120)
         sys.exit(0)
     fresh = not os.path.exists(store + 'model/checkpoint-144.index')
@@ -823,7 +992,30 @@ print('>>> EVALUATE COMPLETE levels=%d' % len(levels), flush=True)
             Check (-not [IO.Directory]::Exists((Join-Path $sim 'Malta\runs\_smoke_envmem\logs'))) 'nothing was launched while the port was busy'
         } finally { ${function:Invoke-RunnerCleanup} = $origCleanup }
 
-        foreach ($r in '_smoke_fake', '_smoke_hang', '_smoke_nan', '_smoke_stop', '_smoke_slow', '_smoke_adopt', '_smoke_abort', '_smoke_exittwo', '_smoke_refuse', '_smoke_late', '_smoke_envmem') { Check (-not (Test-RunProcessAlive $r)) "no python of $r is left alive" }
+        # --- Final-review fixes -----------------------------------------------------------
+        # 3. arms.<arm>.checkpoint_gap_min is honoured (arm 'gap': 0.05 min): the watchdog kills a
+        #    launch that saved checkpoint 144 and then hangs; the relaunch finishes the run.
+        # 4. utils.py changes after _smoke_fake (the previous DONE run) finished: _smoke_gap's
+        #    first launch logs a WARNING and goes ahead; its later launches do not warn again.
+        Put (Join-Path $sim 'config\runs\_smoke_gap.ini') ($SmokeIni -replace 'comm_arch = fog', 'comm_arch = gap')
+        Put (Join-Path $sim 'config\queue_l.txt') "_smoke_fake`n_smoke_gap`n"
+        $stp = Join-Path $sim 'Malta\runs\_queue\state.json'
+        Put $stp ((Read-SharedText $stp) -replace '"arms":\s*\{', '"arms": { "gap": { "peak_commit_gb": 0.5, "checkpoint_gap_min": 0.05 },')
+        Put (Join-Path $sim 'utils.py') "# changed after _smoke_fake finished`n"
+        $res = & $drive 'queue_l.txt'
+        Check ($res.Status -eq 'QUEUE_DONE' -and [IO.File]::Exists((Join-Path $sim 'Malta\runs\_smoke_gap\DONE'))) "the gap run finishes: $($res.Status) $($res.Detail)"
+        $ql = Read-SharedText (Join-Path $sim 'Malta\runs\_queue\queue.log')
+        Check ($ql -match '_smoke_gap: watching launch_r1 \(.*checkpoint-gap limit 0\.05 min\)') 'the configured gap limit is used for the launch'
+        Check ($ql -match '_smoke_gap: killing launch_r1: watchdog: no Checkpoint saved line for [\d.]+ min \(limit 0\.05 min\)') 'the watchdog killed launch_r1 at the configured gap'
+        $gs = Join-Path $sim 'Malta\runs\_smoke_gap'
+        Check ((Read-SharedText (Join-Path $gs 'logs\launch_r1.log')) -match 'step 144 ->' -and [IO.File]::Exists((Join-Path $gs 'logs\launch_r2.log')) -and -not [IO.File]::Exists((Join-Path $gs 'logs\launch_r3.log'))) 'killed after checkpoint 144, relaunched once'
+        $rc = (Read-QueueState (Join-Path $sim 'Malta\runs\_queue'))['runs']['_smoke_gap']
+        Check ($rc['launches'] -eq 1 -and $rc['no_progress'] -eq 0) "the killed launch made progress (144): $(ConvertTo-Json $rc -Compress -Depth 5)"
+        $xw = [regex]::Matches($ql, '_smoke_gap: WARNING: first launch: code differs from the first launch of _smoke_fake \(_smoke_fake\\logs\\launch_r1\.code\.txt\): ([^;]*);')
+        Check ($xw.Count -eq 1 -and $xw[0].Groups[1].Value -eq 'utils.py') "one cross-run code WARNING naming utils.py only: $($xw.Count) $(if ($xw.Count) { $xw[0].Value })"
+        Check ($ql -notmatch '_smoke_gap: FAILED') 'the code warning does not fail the run'
+
+        foreach ($r in '_smoke_fake', '_smoke_hang', '_smoke_nan', '_smoke_stop', '_smoke_slow', '_smoke_adopt', '_smoke_abort', '_smoke_exittwo', '_smoke_refuse', '_smoke_late', '_smoke_envmem', '_smoke_gap') { Check (-not (Test-RunProcessAlive $r)) "no python of $r is left alive" }
     }
 
     Write-Output ("ALL RUN_QUEUE TESTS PASSED ({0} checks)" -f $script:Asserts)

@@ -9,12 +9,19 @@ Windows PowerShell 5.1, ASCII only.
 Usage
   run_queue.ps1 [-QueueFile config/queue.txt] [-ProjectRoot <abs>]
                 [-PythonExe 'C:\Program Files\Python311\python.exe']
-                [-TaskName 'TORRS training queue'] [-DryRun] [-NoRun]
+                [-TaskName 'TORRS training queue'] [-DryRun] [-NoRun] [-ResetRun <name>]
   The real queue is started only by its scheduled task (tools/register_queue_task.ps1).
   -QueueFile is resolved against -ProjectRoot (default: the parent of tools\).
   -DryRun prints each run's decision and the preflight results and exits 0. It launches no
    training or evaluation and writes nothing in the project; it does run the read-only
    environment check and gen_traffic.py --check-only (their output goes to %TEMP%).
+  -ResetRun <name> lets a FAILED run be retried after its cause is fixed (Invoke-ResetRun).
+   Only while no runner holds the mutex and no queue python is alive (else it exits 1): it
+   resets the run's launch counters (launches, no_progress) and evaluation counters
+   (eval_attempts, eval_launches, eval_levels_next) in state.json, keeping the old values in
+   runs.<name>.resets, moves <store>FAILED to <store>logs\FAILED_<stamp>.txt, logs to
+   queue.log, prints what it changed and exits 0. It launches nothing; the author then
+   enables the task if it is disabled and runs Start-ScheduledTask.
   -NoRun (or dot-sourcing the file) only defines the functions, for the tests.
 
 One pass of the loop (Invoke-RunnerIteration; every pass re-reads the queue file and state.json)
@@ -54,11 +61,17 @@ Files (all under Malta\runs\_queue\, UTF-8 without BOM)
     runs.<run>.measured          recorded for the author, never used as a limit:
                  first_checkpoint_min, max_checkpoint_gap_min, peak_commit_gb (the job's
                  process tree, sampled each poll), eval_f100_min, eval_peak_commit_gb
+    runs.<run>.resets            written by -ResetRun: one entry per reset { at, failed,
+                 failed_detail, launches, no_progress, eval_attempts, eval_launches,
+                 eval_levels_next } holding the values before the reset
   and read (set by hand after the smoke queue; smoke episodes are 720 s, not 3600 s, so the
-  smoke times must be scaled before they are entered):
+  smoke times must be scaled before they are entered; a missing, zero or non-number value
+  means the default):
     arms.<comm_arch>.peak_commit_gb        preflight: headroom >= this + 8 GB (default 60)
     arms.<comm_arch>.first_checkpoint_min  watchdog limit for the first checkpoint, and for
                                            the first EVAL_LEVEL_START (default 240)
+    arms.<comm_arch>.checkpoint_gap_min    watchdog limit between two checkpoints, and the
+                                           longest STOP waits for the next one (default 90)
 
 Per launch (logs in <store>logs\)
   launch_rN.log / .exit (training), eval_rN.log / .exit (evaluation), <kind>_rN.code.txt (code
@@ -70,18 +83,26 @@ Per launch (logs in <store>logs\)
 
 Watch (one poll every 60 s; the log is read from a saved byte offset with shared access)
   training    first 'Checkpoint saved' line within the first-checkpoint limit, then at most
-              90 min between them; a checkpoint-save error (a traceback through
-              _persist_episode, or 'Per-episode checkpoint save failed') -> the tree is killed
-              after 2 min; at each new checkpoint the last train_reward.csv row must have a
-              finite reward and average waiting time, else FAILED (NAN).
+              the checkpoint-gap limit (default 90 min) between them; a checkpoint-save error
+              (a traceback through _persist_episode, or 'Per-episode checkpoint save failed')
+              -> the tree is killed after 2 min; at each new checkpoint the last
+              train_reward.csv row must have a finite reward and average waiting time, else
+              FAILED (NAN).
   evaluation  the first EVAL_LEVEL_START within the first-checkpoint limit; then each level
               (from the previous START or DONE line) within 3 x the f1.00 level time, at
-              least 90 min. Before f1.00 is measured its estimate is (test seeds) x (median
-              training rollout_s from episode_cost.csv), else 360 min. Exceeding a limit
-              kills the tree and fails the attempt.
-  STOP        training: wait for the next checkpoint line (at most 90 min), wait 15 s, kill
-              the tree, run Recovery, exit. Evaluation: kill at once; the attempt is not
-              counted. Removing STOP while the runner waits cancels it.
+              least 90 min; a level above 1.20 (f2.00) within 8 x that time, at least 360
+              min. Before f1.00 is measured its estimate is (test seeds) x (median training
+              rollout_s from episode_cost.csv), else 360 min. Between a DONE line and the
+              next START the next level's limit applies. Exceeding a limit kills the tree and
+              fails the attempt.
+  STOP        training: wait for the next checkpoint line (at most the checkpoint-gap limit),
+              wait 15 s, kill the tree, run Recovery, exit. Evaluation: kill at once; the
+              attempt is not counted. Removing STOP while the runner waits cancels it.
+  Cross-run   warnings only (queue.log 'WARNING:'), never a failure: before a run's first
+              training launch, its code hashes (config.ini excluded) against the first launch
+              of the previous DONE run of the queue file; at the first checkpoint this runner
+              sees of a hybrid run, its neighbours.sha256 against each DONE or in-progress fog
+              run of the queue file (spec 5: hybrid uses the fog maps).
   A FAILED marker written while a job runs kills the job (terminal).
   The PC is kept awake (SetThreadExecutionState) while a job runs.
 
@@ -99,6 +120,16 @@ Deviations from the spec text, on purpose
     of 6 evaluation launches still ends the run (EVAL_FAILED).
   - The environment check prints 'SUMO_HOME=<path>' instead of the bare path, so the line can
     be told apart from TensorFlow's import messages.
+  - Spec 8 gives every level 3 x the f1.00 time (at least 90 min). A level above 1.20 (f2.00:
+    double demand with teleporting off, which may gridlock) gets 8 x that time, at least 360
+    min, so a slow but sound f2.00 does not fail both attempts and stop the queue
+    (EVAL_FAILED). Levels up to 1.20 keep the spec's limit.
+  - Spec 9's 90 min between checkpoints is the default of arms.<arm>.checkpoint_gap_min; the
+    STOP wait uses the same limit.
+  - Training is complete when the newest launch printed TRAINING COMPLETE and every other spec
+    9 condition holds, even if it then exited non-zero (a TensorFlow crash at teardown); the
+    exit code is logged as a WARNING (queue_lib Test-TrainingComplete).
+  - -ResetRun (not in the spec) is the author's way to retry a FAILED run.
 #>
 param(
     [string]$QueueFile = 'config/queue.txt',
@@ -106,7 +137,8 @@ param(
     [string]$PythonExe = 'C:\Program Files\Python311\python.exe',
     [string]$TaskName = 'TORRS training queue',
     [switch]$DryRun,
-    [switch]$NoRun
+    [switch]$NoRun,
+    [string]$ResetRun
 )
 
 $ErrorActionPreference = 'Stop'
@@ -124,10 +156,13 @@ $RunnerCommitReserveGB = 8.0
 $RunnerFreeProjectGB = 60.0
 $RunnerFreeSystemGB = 10.0
 $RunnerFirstCheckpointMin = 240.0
-$RunnerCheckpointGapMin = 90.0
+$RunnerCheckpointGapMin = 90.0               # default of arms.<arm>.checkpoint_gap_min
 $RunnerEvalLevelFactor = 3.0
 $RunnerEvalLevelFloorMin = 90.0
 $RunnerEvalLevelDefaultMin = 360.0
+$RunnerEvalStressAboveLevel = 1.20           # levels above this (f2.00) are stress levels:
+$RunnerEvalStressFactor = 8.0                #   8 x the f1.00 level time,
+$RunnerEvalStressFloorMin = 360.0            #   at least 360 min
 $RunnerSaveErrorGraceSec = 120
 $RunnerStopGraceSec = 15
 $RunnerPortWaitSec = 120
@@ -156,6 +191,7 @@ $RunnerEnvCheckArgs = '-c "import tensorflow, traci, sumolib, os; print(''SUMO_H
 $script:Q = $null
 $script:LoggedOnce = @{}
 $script:KeepAwakeWarned = $false
+$script:NeighbourChecked = @{}     # hybrid runs whose neighbours.sha256 was compared (this process)
 
 # ---------------------------------------------------------------------------------------------
 # Small pure helpers
@@ -317,13 +353,24 @@ function Get-TrainWatchdogReason {
         return $null
     }
     $g = ($Now - [datetime]$LastCheckpoint).TotalMinutes
-    if ($g -gt $GapMin) { return ('no Checkpoint saved line for {0} min (limit {1} min)' -f (Format-Num $g '0'), (Format-Num $GapMin '0')) }
+    if ($g -gt $GapMin) { return ('no Checkpoint saved line for {0} min (limit {1} min)' -f (Format-Num $g '0.#'), (Format-Num $GapMin '0.##')) }
     $null
 }
 
-function Get-EvalLevelLimitMinutes($F100Minutes, [double[]]$RolloutSeconds, [int]$Seeds) {
+function Test-StressLevel($Level) {
+    # Whether a level ('2.00' string or a number) is above $RunnerEvalStressAboveLevel.
+    if ($null -eq $Level -or ([string]$Level).Trim().Length -eq 0) { return $false }
+    $lv = 0.0
+    if (-not [double]::TryParse(([string]$Level).Trim(), $QueueFloatStyle, $QueueInvariant, [ref]$lv)) { return $false }
+    $lv -gt $RunnerEvalStressAboveLevel + 1e-9
+}
+
+function Get-EvalLevelLimitMinutes($F100Minutes, [double[]]$RolloutSeconds, [int]$Seeds, $Level = $null) {
     # Spec 8: 3 x the measured f1.00 level time, at least 90 min. Before f1.00 is measured:
     # 3 x (seeds x median training rollout), at least 90 min; with no data 360 min.
+    # Deviation from spec 8: a stress level above 1.20 (f2.00: double demand, teleporting off,
+    # it may gridlock) gets 8 x that base time, at least 360 min (360 min with no data).
+    $stress = Test-StressLevel $Level
     $base = $null
     if ($null -ne $F100Minutes -and [double]$F100Minutes -gt 0) { $base = [double]$F100Minutes }
     elseif ($null -ne $RolloutSeconds -and $RolloutSeconds.Count -gt 0 -and $Seeds -gt 0) {
@@ -332,8 +379,24 @@ function Get-EvalLevelLimitMinutes($F100Minutes, [double[]]$RolloutSeconds, [int
         if ($k % 2 -eq 1) { $median = $sorted[($k - 1) / 2] } else { $median = ($sorted[$k / 2 - 1] + $sorted[$k / 2]) / 2.0 }
         if ($median -gt 0) { $base = $Seeds * $median / 60.0 }
     }
-    if ($null -eq $base) { return $RunnerEvalLevelDefaultMin }
+    if ($null -eq $base) {
+        if ($stress) { return [Math]::Max($RunnerEvalLevelDefaultMin, $RunnerEvalStressFloorMin) }
+        return $RunnerEvalLevelDefaultMin
+    }
+    if ($stress) { return [Math]::Max($RunnerEvalStressFloorMin, $RunnerEvalStressFactor * $base) }
     [Math]::Max($RunnerEvalLevelFloorMin, $RunnerEvalLevelFactor * $base)
+}
+
+function Get-JobLevelForLimit($Job) {
+    # The level whose time limit applies now: the level in progress, else (after an
+    # EVAL_LEVEL_DONE, before the next START) the next level of the job's --levels (or of the
+    # config's eval_levels); $null before the first level or when it cannot be told.
+    if ($Job.CurrentLevel) { return [string]$Job.CurrentLevel }
+    if (-not $Job.LevelSeen) { return $null }
+    $list = Get-StringList $Job.Levels
+    if ($list.Count -eq 0 -and $null -ne $Job.Cfg) { $list = [string[]]@(@($Job.Cfg.EvalLevels) | ForEach-Object { Format-Level $_ }) }
+    if ([int]$Job.DoneLevels -lt $list.Count) { return $list[[int]$Job.DoneLevels] }
+    $null
 }
 
 function Get-EvalTimeoutReason([datetime]$Now, [datetime]$PhaseStart, [bool]$LevelSeen, [string]$Level, [double]$PreLimitMin, [double]$LevelLimitMin) {
@@ -648,6 +711,76 @@ function Test-CodeHashes([string]$RunName) {
 }
 
 # ---------------------------------------------------------------------------------------------
+# Cross-run consistency (warnings only, never a failure)
+# ---------------------------------------------------------------------------------------------
+function Get-CodeLinesWithoutConfig([string[]]$Lines) {
+    # Code-hash lines without config.ini: each run has its own config by design.
+    , [string[]]@(@($Lines) | Where-Object { $_ -notmatch '^\S+\s+config\.ini\s*$' })
+}
+
+function Compare-CrossRunCode([string[]]$Lines, [string]$OtherRun) {
+    # A run's first-launch code hashes against the first training launch of another run (the
+    # previous DONE run of the queue), config.ini excluded. -> $null when there is nothing to
+    # compare, else { Same; Detail }.
+    if ([string]::IsNullOrEmpty($OtherRun)) { return $null }
+    $first = Get-FirstCodeHashFile $OtherRun
+    if ($null -eq $first) { return $null }
+    $diff = @(Compare-CodeHashLines (Get-CodeLinesWithoutConfig @(Read-CodeHashFile $first)) (Get-CodeLinesWithoutConfig $Lines))
+    $where = $OtherRun + '\logs\' + [IO.Path]::GetFileName($first)
+    if ($diff.Count -eq 0) { return [pscustomobject]@{ Same = $true; Detail = ('same code as the first launch of {0} ({1}; config.ini not compared)' -f $OtherRun, $where) } }
+    [pscustomobject]@{ Same = $false; Detail = ('code differs from the first launch of {0} ({1}): {2}' -f $OtherRun, $where, ($diff -join ', ')) }
+}
+
+function Write-CrossRunCodeCheck([string]$RunName, [string[]]$Lines, [string]$PreviousDone) {
+    # Logged before a run's first training launch: a WARNING when its code differs from the
+    # previous DONE run's first launch (the arms would not have run the same code).
+    try {
+        $x = Compare-CrossRunCode $Lines $PreviousDone
+        if ($null -eq $x) { return }
+        if ($x.Same) { Write-QueueLog ('{0}: first launch: {1}' -f $RunName, $x.Detail) }
+        else { Write-QueueLog ('{0}: WARNING: first launch: {1}; the runs will not have used the same code (not a failure)' -f $RunName, $x.Detail) }
+    } catch { Write-QueueLog ('{0}: cross-run code comparison failed (ignored): {1}' -f $RunName, $_.Exception.Message) }
+}
+
+function Read-NeighbourHash([string]$RunName) {
+    $p = Join-Path (Assert-QueueStore $RunName) 'neighbours.sha256'
+    if (-not [IO.File]::Exists($p)) { return $null }
+    $h = (Read-SharedText $p).Trim()
+    if ($h.Length -eq 0) { return $null }
+    $h
+}
+
+function Compare-HybridNeighbourHash([string]$RunName) {
+    # Spec 5: hybrid uses the fog neighbour maps. A hybrid run's neighbours.sha256 (written at
+    # its first launch) against that of every fog run of the queue file that is DONE or in
+    # progress (a store with neighbours.sha256 and no FAILED marker). -> one line per fog run,
+    # 'WARNING: ...' when the hashes differ; nothing when the run is not hybrid or there is
+    # nothing to compare yet.
+    $ini = Get-RunIniPath $RunName
+    if ($null -eq $ini -or (Get-RunArm $ini) -ne 'hybrid') { return }
+    $own = Read-NeighbourHash $RunName
+    if ($null -eq $own) { return }
+    foreach ($r in @((Get-QueueRunList).Runs)) {
+        if ($r -eq $RunName -or -not (Test-QueueRunName $r)) { continue }
+        $rIni = Get-RunIniPath $r
+        if ($null -eq $rIni -or (Get-RunArm $rIni) -ne 'fog') { continue }
+        if ([IO.File]::Exists((Join-Path (Assert-QueueStore $r) 'FAILED'))) { continue }
+        $h = Read-NeighbourHash $r
+        if ($null -eq $h) { continue }
+        if ($h -ceq $own) { '{0}: neighbours.sha256 matches fog run {1} ({2})' -f $RunName, $r, $own }
+        else { '{0}: WARNING: neighbours.sha256 {1} differs from fog run {2} ({3}); hybrid should use the fog neighbour maps (spec 5; not a failure)' -f $RunName, $own, $r, $h }
+    }
+}
+
+function Write-HybridNeighbourCheck([string]$RunName) {
+    # Once per runner process and run, at the first checkpoint it sees of a training job.
+    if ($script:NeighbourChecked.ContainsKey($RunName)) { return }
+    $script:NeighbourChecked[$RunName] = $true
+    try { foreach ($l in @(Compare-HybridNeighbourHash $RunName)) { if ($l) { Write-QueueLog $l } } }
+    catch { Write-QueueLog ('{0}: neighbour-hash comparison failed (ignored): {1}' -f $RunName, $_.Exception.Message) }
+}
+
+# ---------------------------------------------------------------------------------------------
 # Processes
 # ---------------------------------------------------------------------------------------------
 function Get-ProcessTable {
@@ -953,7 +1086,7 @@ function New-JobRecord {
         PhaseStart = $Started; LevelSeen = $false; CurrentLevel = $null; LevelStarts = @{}; F100Min = $null; DoneLevels = 0
         StopSince = $null; StopCkptBase = 0; Adopted = $false; Polled = $false; AdoptCkptBase = 0
         EndReason = $null; EndDetail = $null; TimedOutLevel = $null; PeakCommitGB = 0.0
-        FirstLimitMin = $RunnerFirstCheckpointMin; Rollouts = $null; StateF100 = $null
+        FirstLimitMin = $RunnerFirstCheckpointMin; GapMin = $RunnerCheckpointGapMin; Rollouts = $null; StateF100 = $null
     }
 }
 
@@ -1063,6 +1196,7 @@ function Update-JobFromLog($Job, $State) {
     Save-JobMeasurements $Job $State
     Save-QueueState $Q.QueueDir $State
     Write-QueueLog ("{0}: {1} checkpoint-{2} saved ({3} new)" -f $Job.Run, $Job.Label, $Job.LastCkptStep, $Job.NewCkpt)
+    Write-HybridNeighbourCheck $Job.Run
 }
 
 function Save-JobMeasurements($Job, $State) {
@@ -1331,7 +1465,7 @@ function Step-RunnerJob($Job, $State) {
         if ($stop) { Stop-RunnerJob $Job 'STOP during evaluation'; $Job.EndReason = 'STOP'; return }
         $f100 = $Job.F100Min
         if ($null -eq $f100) { $f100 = $Job.StateF100 }
-        $limit = Get-EvalLevelLimitMinutes $f100 $Job.Rollouts (@($Job.Cfg.TestSeeds).Count)
+        $limit = Get-EvalLevelLimitMinutes $f100 $Job.Rollouts (@($Job.Cfg.TestSeeds).Count) (Get-JobLevelForLimit $Job)
         $why = Get-EvalTimeoutReason $now ([datetime]$Job.PhaseStart) $Job.LevelSeen $Job.CurrentLevel $Job.FirstLimitMin $limit
         if ($null -ne $why) {
             $Job.TimedOutLevel = $Job.CurrentLevel
@@ -1349,9 +1483,9 @@ function Step-RunnerJob($Job, $State) {
             # came from an adopted job's existing log.
             $Job.StopSince = $now
             $Job.StopCkptBase = [Math]::Max($Job.CkptCount - $Job.NewCkpt, $Job.AdoptCkptBase)
-            Write-QueueLog ("{0}: STOP seen; waiting for the next checkpoint of {1} (at most {2} min)" -f $Job.Run, $Job.Label, $RunnerCheckpointGapMin)
+            Write-QueueLog ("{0}: STOP seen; waiting for the next checkpoint of {1} (at most {2} min)" -f $Job.Run, $Job.Label, (Format-Num $Job.GapMin '0.##'))
         }
-        if ($Job.CkptCount -gt $Job.StopCkptBase -or ($now - [datetime]$Job.StopSince).TotalMinutes -ge $RunnerCheckpointGapMin) {
+        if ($Job.CkptCount -gt $Job.StopCkptBase -or ($now - [datetime]$Job.StopSince).TotalMinutes -ge $Job.GapMin) {
             Write-RunnerStatus 'STOPPING' ('{0}: checkpoint-{1} saved; stopping in {2} s' -f $Job.Run, $Job.LastCkptStep, $RunnerStopGraceSec)
             Start-Sleep -Seconds $RunnerStopGraceSec
             Stop-RunnerJob $Job 'STOP'
@@ -1366,7 +1500,7 @@ function Step-RunnerJob($Job, $State) {
         $Job.StopSince = $null
     }
     $why = Get-TrainWatchdogReason -Now $now -Started $Job.Started -LastCheckpoint $Job.LastCkptTime -FirstLimitMin $Job.FirstLimitMin `
-        -GapMin $RunnerCheckpointGapMin -SaveErrorAt $Job.SaveErrorAt -SaveErrorGraceSec $RunnerSaveErrorGraceSec
+        -GapMin $Job.GapMin -SaveErrorAt $Job.SaveErrorAt -SaveErrorGraceSec $RunnerSaveErrorGraceSec
     if ($null -ne $why) { Stop-RunnerJob $Job ('watchdog: ' + $why); $Job.EndReason = 'WATCHDOG'; $Job.EndDetail = $why; return }
     Write-RunnerStatus 'TRAINING' (Get-JobStatus $Job)
     Set-KeepAwake $true
@@ -1384,6 +1518,16 @@ function Get-RolloutSeconds([string]$Store) {
     }
     if ($vals.Count -eq 0) { return $null }
     , $vals.ToArray()
+}
+
+function Set-JobLimits($Job, $State) {
+    # The watchdog limits of the run's arm, from state.json: arms.<arm>.first_checkpoint_min
+    # (default 240 min; also the limit for the first EVAL_LEVEL_START) and
+    # arms.<arm>.checkpoint_gap_min (default 90 min; also the longest STOP waits for the next
+    # checkpoint).
+    $arm = Get-RunArm (Get-RunIniPath $Job.Run)
+    $Job.FirstLimitMin = Get-ArmSetting $State $arm 'first_checkpoint_min' $RunnerFirstCheckpointMin
+    $Job.GapMin = Get-ArmSetting $State $arm 'checkpoint_gap_min' $RunnerCheckpointGapMin
 }
 
 function Watch-ForeignJob($Job) {
@@ -1414,14 +1558,15 @@ function Watch-ForeignJob($Job) {
 function Watch-RunnerJob($Job, $State) {
     if ($Job.Foreign) { return (Watch-ForeignJob $Job) }
     Sync-CurrentLaunch $Job $State
-    $ini = Get-RunIniPath $Job.Run
-    $Job.FirstLimitMin = Get-ArmSetting $State (Get-RunArm $ini) 'first_checkpoint_min' $RunnerFirstCheckpointMin
+    Set-JobLimits $Job $State
     if ($Job.Kind -eq 'evaluate') {
         $Job.Rollouts = Get-RolloutSeconds (Assert-QueueStore $Job.Run)
         $m = Get-RunMeasured $State $Job.Run
         if ($m.Contains('eval_f100_min') -and $null -ne $m['eval_f100_min']) { $Job.StateF100 = [double]$m['eval_f100_min'] }
     }
-    Write-QueueLog ("{0}: watching {1} (python pid {2}, wrapper pid {3}, started {4}, first-checkpoint limit {5} min)" -f $Job.Run, $Job.Label, $Job.PyPid, $Job.CmdPid, (Format-Stamp $Job.Started), (Format-Num $Job.FirstLimitMin '0.##'))
+    $limits = 'first-checkpoint limit {0} min' -f (Format-Num $Job.FirstLimitMin '0.##')
+    if ($Job.Kind -eq 'train') { $limits += ', checkpoint-gap limit {0} min' -f (Format-Num $Job.GapMin '0.##') }
+    Write-QueueLog ("{0}: watching {1} (python pid {2}, wrapper pid {3}, started {4}, {5})" -f $Job.Run, $Job.Label, $Job.PyPid, $Job.CmdPid, (Format-Stamp $Job.Started), $limits)
     Set-KeepAwake $true
     while ($null -eq $Job.EndReason) {
         try { Step-RunnerJob $Job $State }
@@ -1474,7 +1619,8 @@ function Complete-TrainLaunch($Job, $State) {
     if ($tc.Ok) {
         $counters['current_launch'] = $null
         Save-QueueState $Q.QueueDir $State
-        Write-QueueLog ("{0}: training complete ({1} exited 0)" -f $run, $Job.Label)
+        if ($null -ne $tc.Warning) { Write-QueueLog ("{0}: WARNING: training complete, but {1}" -f $run, $tc.Warning) }
+        else { Write-QueueLog ("{0}: training complete ({1} exited 0)" -f $run, $Job.Label) }
         return (New-RunnerResult 'CONTINUE')
     }
     Write-QueueLog ("{0}: {1} ended without completing training: {2}; not complete because: {3}" -f $run, $Job.Label, (Get-LaunchSummary $Job $outcome), $tc.Reason)
@@ -1568,8 +1714,9 @@ function Get-QueueRunList {
     [pscustomobject]@{ Runs = $runs; Problem = $null }
 }
 
-function Start-RunStep([string]$RunName, [string]$IniPath, $Cfg, [string]$Stage, $State) {
+function Start-RunStep([string]$RunName, [string]$IniPath, $Cfg, [string]$Stage, $State, [string]$PreviousDone = $null) {
     # Recovery (TRAIN), checks, preflight, cleanup, launch and watch for one run.
+    # $PreviousDone: the queue file's last DONE run before this one (cross-run code warning).
     $counters = Get-RunCounters $State $RunName
     $levels = $null
     if ($Stage -eq 'TRAIN') {
@@ -1614,6 +1761,7 @@ function Start-RunStep([string]$RunName, [string]$IniPath, $Cfg, [string]$Stage,
         return (New-RunnerResult 'WAIT' 'WAITING_PORT_BUSY' ('{0} {1}: TCP {2} still busy after {3} s' -f $RunName, $Stage, $QueueTrainPort, $RunnerPortWaitSec))
     }
     if ([IO.File]::Exists($Q.StopFile)) { return (New-RunnerResult 'STOPPED' 'STOPPED' 'STOP present; nothing launched') }
+    if ($Stage -eq 'TRAIN' -and $null -eq (Get-FirstCodeHashFile $RunName)) { Write-CrossRunCodeCheck $RunName $code.Lines $PreviousDone }
     $job = Start-RunnerLaunch $RunName $Cfg $Stage $levels $State $code.Lines
     Watch-RunnerJob $job $State
 }
@@ -1644,6 +1792,7 @@ function Invoke-RunnerIteration {
     if ([IO.File]::Exists($Q.StopFile)) { return (New-RunnerResult 'STOPPED' 'STOPPED' 'STOP present; nothing launched') }
 
     # 4. The runs, in order.
+    $prevDone = $null
     foreach ($run in $runs) {
         $ini = Get-RunIniPath $run
         if ($null -eq $ini) { return (New-RunnerResult 'WAIT' 'WAITING_CONFIG' ("{0}: config\runs\{0}.ini not found" -f $run)) }
@@ -1655,10 +1804,11 @@ function Invoke-RunnerIteration {
                 [void](Write-RunMarker $run 'DONE' ('DONE ' + (Get-Date).ToString('o') + "`r`n"))
                 Write-QueueLog ("{0}: eva_data\EVAL_OK present without DONE; wrote DONE" -f $run)
             }
+            $prevDone = $run
             continue
         }
         if ($stage -eq 'FAILED') { return (Get-FailedResult $run) }
-        return (Start-RunStep $run $ini $cfg $stage $state)
+        return (Start-RunStep $run $ini $cfg $stage $state $prevDone)
     }
     New-RunnerResult 'TERMINAL' 'QUEUE_DONE' ('every run is DONE: ' + ($runs -join ', '))
 }
@@ -1786,14 +1936,23 @@ function Invoke-DryRun {
     else { Write-Host ('Next action : {0} {1}' -f $nextRun[0], $nextRun[1].Stage) }
 
     $cache = @{}
+    $prevDone = $null
     foreach ($pair in $decisions) {
         $run = $pair[0]; $d = $pair[1]
+        if ($d.Stage -eq 'DONE') { $prevDone = $run; continue }
         if (-not $d.Actionable) { continue }
         Write-Host ('Preflight for {0} ({1}, arm {2}):' -f $run, $d.Stage, (Get-RunArm $d.Ini))
         $code = Test-CodeHashes $run
         $cv = 'PASS'
         if (-not $code.Ok) { $cv = 'FAILED_CODE_CHANGED' }
         Write-Host ('  {0,-14}: {1} ({2})' -f 'code hashes', $cv, $code.Detail)
+        if ($d.Stage -eq 'TRAIN' -and $null -eq (Get-FirstCodeHashFile $run)) {
+            $x = Compare-CrossRunCode $code.Lines $prevDone
+            $xv = 'no previous DONE run with a launch to compare'
+            if ($null -ne $x -and $x.Same) { $xv = 'SAME (' + $x.Detail + ')' }
+            elseif ($null -ne $x) { $xv = 'WARNING (' + $x.Detail + '; logged, not a failure)' }
+            Write-Host ('  {0,-14}: {1}' -f 'cross-run code', $xv)
+        }
         $pf = Invoke-Preflight $run $d.Cfg (Get-RunArm $d.Ini) $state $cache
         foreach ($l in $pf.Lines) { Write-Host (Format-PreflightLine $l) }
         $result = 'PASS - the runner would launch now'
@@ -1803,6 +1962,108 @@ function Invoke-DryRun {
         Write-Host ('  {0,-14}: {1}' -f 'result', $result)
     }
     Write-Host 'Nothing launched (DryRun).'
+}
+
+# ---------------------------------------------------------------------------------------------
+# -ResetRun: retry a FAILED run once its cause is fixed
+# ---------------------------------------------------------------------------------------------
+function Get-QueuePythonList($Table) {
+    # Live pythons running 'main.py ... --run <any run>' (a queue launch), as text.
+    foreach ($p in @($Table)) {
+        if ($null -eq $p -or -not (Test-PythonName $p.Name)) { continue }
+        $cl = [string]$p.CommandLine
+        if ($cl -match '(?i)(?:^|[\s"''\\/])main\.py["'']?\s.*?--run(?:\s+|=)') { 'python pid {0}: {1}' -f $p.ProcessId, (ConvertTo-OneLine $cl 300) }
+    }
+}
+
+function Get-QueueTaskStates {
+    # '<task>: <state>' for the scheduled task(s) of this queue (read only), or a note.
+    $tasks = @()
+    try { $tasks = @(Get-ScheduledTask -ErrorAction Stop) } catch { return ('cannot list scheduled tasks: ' + $_.Exception.Message) }
+    $mine = @(Select-QueueTasks $tasks $Q.TaskName $Q.TaskNameGiven $Q.QueueFile $Q.Root)
+    if ($mine.Count -eq 0) { return ('no scheduled task runs this queue ({0})' -f $Q.QueueFile) }
+    foreach ($t in $mine) { "'{0}{1}' is {2}" -f $t.TaskPath, $t.TaskName, $t.State }
+}
+
+function Invoke-ResetRun([string]$RunName) {
+    # -ResetRun <name>: lets a FAILED run be retried after the author fixed its cause. It
+    # launches nothing. Refused while a runner holds the mutex or a queue python is alive (the
+    # mutex is held during the reset, so a runner starting meanwhile waits). Otherwise:
+    #   - state.json runs.<name>: the launch counters (launches, no_progress) and the
+    #     evaluation counters (eval_attempts, eval_launches, eval_levels_next) are reset; the
+    #     old values (and the FAILED code) are appended to runs.<name>.resets. interrupted,
+    #     good_at_launch, measured and current_launch are kept;
+    #   - <store>FAILED is moved to <store>logs\FAILED_<stamp>.txt (never deleted);
+    #   - one line goes to queue.log, and every change is printed.
+    # -> 0 (done) or 1 (refused).
+    $say = { param([string]$Text) Write-Host $Text }
+    if (-not (Test-QueueRunName $RunName)) { & $say ("ResetRun refused: invalid run name '{0}'" -f $RunName); return 1 }
+    $store = Assert-QueueStore $RunName
+    if (-not [IO.Directory]::Exists($store)) { & $say ('ResetRun refused: run {0} has no store ({1})' -f $RunName, $store); return 1 }
+    $mutex = New-Object System.Threading.Mutex($false, $RunnerMutexName)
+    $owned = $false
+    try {
+        $owned = Enter-RunnerMutex $mutex 0
+        if (-not $owned) {
+            & $say ('ResetRun refused: a queue runner is active (it holds {0}). Stop it first (create Malta\runs\_queue\STOP and wait for status.txt to show STOPPED).' -f $RunnerMutexName)
+            return 1
+        }
+        $live = @(Get-QueuePythonList @(Get-ProcessTable))
+        if ($live.Count -gt 0) { & $say ('ResetRun refused: a queue python is alive: ' + ($live -join '; ')); return 1 }
+
+        $state = Read-QueueState $Q.QueueDir
+        $counters = Get-RunCounters $state $RunName
+        $failedPath = Join-Path $store 'FAILED'
+        $code = $null; $detail = $null
+        if ([IO.File]::Exists($failedPath)) { $code = Get-MarkerLine $failedPath 0; $detail = Get-MarkerLine $failedPath 1 }
+        $now = Get-Date
+        $old = [ordered]@{ at = $now.ToString('o'); failed = $code; failed_detail = $detail }
+        $changes = New-Object System.Collections.Generic.List[string]
+        foreach ($k in 'launches', 'no_progress', 'eval_attempts', 'eval_launches') {
+            $v = 0
+            if ($counters.Contains($k) -and $null -ne $counters[$k]) { $v = [int]$counters[$k] }
+            $old[$k] = $v
+            $changes.Add(('{0} {1} -> 0' -f $k, $v))
+            $counters[$k] = 0
+        }
+        $nextLevels = Get-StringList $counters['eval_levels_next']
+        $old['eval_levels_next'] = $nextLevels
+        $changes.Add(('eval_levels_next [{0}] -> []' -f ($nextLevels -join ',')))
+        $counters['eval_levels_next'] = @()
+        $resets = @()
+        if ($counters.Contains('resets') -and $null -ne $counters['resets']) { $resets = @($counters['resets']) }
+        $resets += , $old
+        $counters['resets'] = $resets
+        Save-QueueState $Q.QueueDir $state
+
+        $what = 'no FAILED marker was present'
+        if ($null -ne $code) {
+            $logs = Join-Path $store 'logs'
+            if (-not [IO.Directory]::Exists($logs)) { [void][IO.Directory]::CreateDirectory($logs) }
+            $base = 'FAILED_' + $now.ToString('yyyyMMdd_HHmmss', $QueueInvariant)
+            $dest = Join-Path $logs ($base + '.txt')
+            $k = 1
+            while ([IO.File]::Exists($dest)) { $k++; $dest = Join-Path $logs ('{0}_{1}.txt' -f $base, $k) }
+            Move-Item -LiteralPath $failedPath -Destination $dest -ErrorAction Stop
+            $what = 'FAILED ({0}) moved to {1}' -f $code, $dest
+        }
+        Write-QueueLog ('{0}: ResetRun (pid {1}): {2}; state.json counters reset: {3}; old values appended to runs.{0}.resets' -f $RunName, $PID, $what, ($changes -join ', '))
+
+        & $say ('ResetRun {0} (nothing launched)' -f $RunName)
+        & $say ('  marker     : ' + $what)
+        if ($detail) { & $say ('  it said    : ' + $detail) }
+        & $say ('  state.json : runs.{0}: {1}' -f $RunName, ($changes -join ', '))
+        & $say ('  kept       : interrupted {0}, good_at_launch ({1} entries), measured; the old values are in runs.{2}.resets ({3} reset(s) so far)' -f $counters['interrupted'], @($counters['good_at_launch']).Count, $RunName, $resets.Count)
+        if ($null -ne $counters['current_launch']) { & $say '  note       : a launch is still recorded in flight (current_launch); the runner completes it on its next start' }
+        if ([IO.File]::Exists((Join-Path $store 'DONE'))) { & $say '  note       : the run has a DONE marker; the runner skips it' }
+        if ([IO.File]::Exists($Q.StopFile)) { & $say '  note       : Malta\runs\_queue\STOP exists; delete it before starting the task, or the runner exits STOPPED' }
+        foreach ($l in @(Get-QueueTaskStates)) { & $say ('  task       : ' + $l) }
+        & $say "  next       : if the task is Disabled (it is after a FAILED stop): Enable-ScheduledTask 'TORRS training queue'; then Start-ScheduledTask 'TORRS training queue'"
+        return 0
+    } finally {
+        if ($owned) { try { $mutex.ReleaseMutex() } catch { } }
+        $mutex.Dispose()
+    }
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -1866,6 +2127,20 @@ function Invoke-RunnerMain {
 }
 
 if ($NoRun -or $MyInvocation.InvocationName -eq '.') { return }
+
+if ($PSBoundParameters.ContainsKey('ResetRun')) {
+    $resetCode = 1
+    try {
+        if ($DryRun) { throw '-ResetRun cannot be combined with -DryRun' }
+        Initialize-RunnerContext -ProjectRoot $ProjectRoot -QueueFile $QueueFile -PythonExe $PythonExe -TaskName $TaskName `
+            -TaskNameGiven ($PSBoundParameters.ContainsKey('TaskName')) -DryRun $false
+        $resetCode = Invoke-ResetRun $ResetRun
+    } catch {
+        Write-Host ('ResetRun failed: ' + (Format-RunnerError $_))
+        $resetCode = 1
+    }
+    exit $resetCode
+}
 
 $checks = $null
 if ($DryRun) { $checks = Join-Path $env:TEMP ('torrs_queue_dryrun_' + $PID) }

@@ -6,10 +6,11 @@ Tests: tests/test_queue_lib.ps1 (powershell -NoProfile -ExecutionPolicy Bypass -
 Windows PowerShell 5.1. Dot-source it:  . (Join-Path $PSScriptRoot 'queue_lib.ps1')
 
 These functions decide; they do not launch processes and never delete a file. The only side
-effects are the writes a caller asks for (Write-Utf8NoBom, Add-Utf8NoBomLine, Save-QueueState)
-and Invoke-Recovery, which only moves files into the queue folder, rewrites the three run CSVs
-after copying the originals there, and notes each handled restore error in
-quarantine_<stamp>\restore_errors.txt so it is handled once.
+effects are the writes a caller asks for (Write-Utf8NoBom, Write-Utf8NoBomDurable,
+Add-Utf8NoBomLine, Save-QueueState) and Invoke-Recovery, which only moves files into the queue
+folder, rewrites the three run CSVs after copying the originals there (each through a
+'<csv>.qtmp' temp file flushed to the disk before it is moved over the CSV), and notes each
+handled restore error in quarantine_<stamp>\restore_errors.txt so it is handled once.
 
 Paths
   Functions take the absolute project root and the run name. Files are reached through absolute
@@ -21,6 +22,7 @@ Paths
 
 Functions
   Write-Utf8NoBom $Path $Text                 Add-Utf8NoBomLine $Path $Line
+  Write-Utf8NoBomDurable $Path $Text          (flushed to the disk before it returns)
   Read-SharedText $Path -> string              Read-ExitCode $ExitFile -> Int64 or $null
   Read-RunConfig $IniPath -> { IniPath; TotalStep; T; Seed; TestSeeds; EvalLevels; Scenario }
   Get-QueueRuns $QueueFile -> run names (blank and # lines skipped; wrap the call in @())
@@ -31,7 +33,7 @@ Functions
   Get-GoodCheckpoint $ProjectRoot $RunName -> int (-1 if none)
   Test-RunCommandLine $RunName $ProcessName $CommandLine -> bool
   Test-RunProcessAlive $RunName -> bool
-  Test-TrainingComplete $ProjectRoot $RunName $Cfg [-ProcessAlive] -> { Ok; Reason }
+  Test-TrainingComplete $ProjectRoot $RunName $Cfg [-ProcessAlive] -> { Ok; Reason; Warning }
   Get-RunStage $ProjectRoot $RunName $Cfg [-ProcessAlive] -> 'DONE' | 'FAILED' | 'EVALUATE' | 'TRAIN'
   Invoke-Recovery $ProjectRoot $RunName $Cfg $QueueDir [-ProcessAlive] [-Log {param($m)}]
                                               -> 'RESUME' | 'SCRATCH' | 'NEEDS_REVIEW:<reason>'
@@ -42,8 +44,8 @@ Functions
 
 -ProcessAlive: $null (the default) asks Test-RunProcessAlive; $true or $false skips the query.
 
-state.json (<QueueDir>\state.json, UTF-8 without BOM; Save-QueueState writes state.json.tmp
-and then Move-Item -Force onto state.json; Read-QueueState falls back to state.json.tmp when
+state.json (<QueueDir>\state.json, UTF-8 without BOM; Save-QueueState writes state.json.tmp,
+flushes it to the disk and then Move-Item -Force onto state.json; Read-QueueState falls back to state.json.tmp when
 state.json is missing or unreadable). Read-QueueState returns nested ordered hashtables; JSON
 arrays stay arrays. Schema version 1:
 
@@ -148,6 +150,23 @@ function Add-Utf8NoBomLine {
     $dir = [IO.Path]::GetDirectoryName($Path)
     if ($dir -and -not [IO.Directory]::Exists($dir)) { [void][IO.Directory]::CreateDirectory($dir) }
     [IO.File]::AppendAllText($Path, $Line + "`r`n", $QueueUtf8NoBom)
+}
+
+function Write-Utf8NoBomDurable {
+    param([Parameter(Mandatory = $true)][string]$Path, [AllowEmptyString()][string]$Text = '')
+    # Like Write-Utf8NoBom, but the data is flushed to the disk (FlushFileBuffers) before it
+    # returns, so a temp file moved over the real one right after cannot turn into an empty
+    # or partial file after a power cut.
+    $ErrorActionPreference = 'Stop'
+    Assert-AbsolutePath $Path 'Write-Utf8NoBomDurable path'
+    $dir = [IO.Path]::GetDirectoryName($Path)
+    if ($dir -and -not [IO.Directory]::Exists($dir)) { [void][IO.Directory]::CreateDirectory($dir) }
+    $bytes = $QueueUtf8NoBom.GetBytes($Text)
+    $fs = [IO.FileStream]::new($Path, [IO.FileMode]::Create, [IO.FileAccess]::Write, [IO.FileShare]::None)
+    try {
+        $fs.Write($bytes, 0, $bytes.Length)
+        $fs.Flush($true)
+    } finally { $fs.Dispose() }
 }
 
 function Open-SharedRead([string]$Path) {
@@ -700,21 +719,34 @@ function Test-TrainingComplete {
         [object]$ProcessAlive = $null
     )
     $ErrorActionPreference = 'Stop'
-    # The five conditions of spec 9 -> { Ok; Reason } (Reason lists every failed condition).
+    # The five conditions of spec 9 -> { Ok; Reason; Warning } (Reason lists every failed
+    # condition; Warning is $null or why a complete run is accepted with a non-zero exit).
+    # Deviation from spec 9: when the newest launch printed '>>> TRAINING COMPLETE step
+    # <total_step>' and every other condition holds, a non-zero exit code is accepted (with a
+    # Warning): TensorFlow can crash while tearing down after the run finished, and a relaunch
+    # would only crash the same way. Without the COMPLETE line the exit code must still be 0,
+    # and a missing exit code is never accepted.
     $store = Get-StoreDir $ProjectRoot $RunName
     $total = [int]$Cfg.TotalStep
     $problems = New-Object System.Collections.Generic.List[string]
-    # 1. The newest training launch printed TRAINING COMPLETE step <total_step> and exited 0.
+    $warning = $null
+    $exitProblem = $null      # a non-zero exit after the COMPLETE line; decided at the end
+    # 1. The newest training launch printed TRAINING COMPLETE step <total_step> and exited 0
+    #    (or exited non-zero after printing it; see above).
     $launches = @(Get-LaunchFiles $ProjectRoot $RunName 'launch')
     if ($launches.Count -eq 0) { $problems.Add('no training launch yet') }
     else {
         $last = $launches[-1]
         $code = Read-ExitCode $last.Exit
-        if ($null -eq $code) { $problems.Add("launch_r$($last.N).exit has no exit code") }
-        elseif ($code -ne 0) { $problems.Add("launch_r$($last.N) exited $code") }
         $text = ''
         if ([IO.File]::Exists($last.Log)) { $text = Read-SharedText $last.Log }
-        if (-not [regex]::IsMatch($text, '(?m)>>> TRAINING COMPLETE step ' + $total + '\r?$')) {
+        $complete = [regex]::IsMatch($text, '(?m)>>> TRAINING COMPLETE step ' + $total + '\r?$')
+        if ($null -eq $code) { $problems.Add("launch_r$($last.N).exit has no exit code") }
+        elseif ($code -ne 0) {
+            if ($complete) { $exitProblem = "launch_r$($last.N) exited $code" }
+            else { $problems.Add("launch_r$($last.N) exited $code") }
+        }
+        if (-not $complete) {
             $problems.Add("launch_r$($last.N).log has no '>>> TRAINING COMPLETE step $total' line")
         }
     }
@@ -725,10 +757,15 @@ function Test-TrainingComplete {
     if (-not (Test-CheckpointFiles (Join-Path $store 'model') $total)) { $problems.Add("checkpoint-$total lacks a .data, .index or .meta file") }
     # 4-5. Reward CSVs: row counts, finite values, seed column.
     Add-RewardCsvProblems $store $Cfg $problems
+    if ($null -ne $exitProblem) {
+        if ($problems.Count -eq 0) { $warning = "$exitProblem after its '>>> TRAINING COMPLETE step $total' line; accepted, because every other condition holds" }
+        else { $problems.Insert(0, $exitProblem) }
+    }
     $ok = ($problems.Count -eq 0)
     $reason = 'training complete'
     if (-not $ok) { $reason = $problems -join '; ' }
-    [pscustomobject]@{ Ok = $ok; Reason = $reason }
+    elseif ($null -ne $warning) { $reason = 'training complete; warning: ' + $warning }
+    [pscustomobject]@{ Ok = $ok; Reason = $reason; Warning = $warning }
 }
 
 function Get-RunStage {
@@ -958,7 +995,9 @@ function Invoke-Recovery {
         & $say ("good checkpoint-{0}; moved {1} to {2}" -f $good, (($unsafe | ForEach-Object { $_.Name }) -join ', '), $quarantine)
     }
 
-    # 5. Copy the originals, then write the trimmed CSVs (temp file, then move over the original).
+    # 5. Copy the originals, then write the trimmed CSVs (temp file '<csv>.qtmp', flushed to
+    #    the disk, then moved over the original), so a power cut right after Recovery cannot
+    #    leave an empty CSV.
     $changed = @($plan.Files | Where-Object { $_.Changed })
     if ($changed.Count -gt 0) {
         foreach ($f in $changed) {
@@ -969,7 +1008,7 @@ function Invoke-Recovery {
         }
         foreach ($f in $changed) {
             $tmp = $f.Path + '.qtmp'
-            Write-Utf8NoBom $tmp $f.New
+            Write-Utf8NoBomDurable $tmp $f.New
             Move-Item -LiteralPath $tmp -Destination $f.Path -Force
         }
         & $say ("trimmed CSVs to checkpoint-{0} ({1}); originals in {2}" -f $good, $plan.Notes, $recovery)
@@ -1230,7 +1269,7 @@ function Save-QueueState {
     Assert-AbsolutePath $QueueDir 'QueueDir'
     $path = Join-Path $QueueDir 'state.json'
     $State['updated'] = (Get-Date).ToString('o')
-    Write-Utf8NoBom ($path + '.tmp') (ConvertTo-Json -InputObject $State -Depth 10)
+    Write-Utf8NoBomDurable ($path + '.tmp') (ConvertTo-Json -InputObject $State -Depth 10)
     Move-Item -LiteralPath ($path + '.tmp') -Destination $path -Force
 }
 

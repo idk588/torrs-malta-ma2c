@@ -88,3 +88,6 @@ Malta/runs/*/sim/
 Malta/runs/*/eva_data/_failed_*/
 Malta/runs/_smoke_*/
 Malta/runs/*/*.tmp
+# Recovery's temp files: <store><csv>.qtmp, flushed and then moved over the CSV
+Malta/runs/*/*.csv.qtmp
+*.qtmp
